@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "caido-mode": {
+      "source": "caido/skills",
+      "sourceType": "github",
+      "skillPath": "skills/caido-mode/SKILL.md",
+      "computedHash": "9522a20d0dde653eb16163e593c14cd7fb496ac56b1b70b9b82ba3ed8c1dcc40"
+    }
+  }
+}
