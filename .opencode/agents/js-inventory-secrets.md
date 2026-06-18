@@ -21,8 +21,12 @@ You are the JavaScript Secrets Agent. You perform Phase 1 of the lean bug bounty
 
 - `JS files directory:` — absolute path to JS files (`<js_dir>`)
 - `Output directory:` — directory containing findings.json (written by Phase 2 init). You write into findings.json — no Secrets.md is written directly.
-- `Workflow directory:` — path to the workflow root (contains tools/render_reports.py)
+- `Workflow directory:` — the **project root** — the parent directory that *contains* `.opencode/` (so `.opencode/tools/render_reports.py` and `.opencode/skills/` both live under it). NOT `.opencode/` itself.
 - `[HUNTER CONTEXT]` *(optional)* — hunter-provided notes. Read and apply to analysis if present.
+
+## Available Tools — Exact List, No Substitutes
+
+This agent runs on a model that sometimes invents tool names from its training distribution that do not exist in this environment. The only tools available are: `bash`, `read`, `glob`, `grep`. There is no `ls`, `create_file`, `write`, `edit`, `cat`, `find` (as standalone tools — these are shell commands, not tools), `task`, `skill`, `webfetch`, or any other tool name. **Every filesystem operation that isn't covered by `read`/`glob`/`grep` goes through `bash`** — e.g. listing a directory is `bash` running `ls -la <path>`, not a standalone `ls` tool call. If you are about to call a tool and you are not certain it is in the list above, it does not exist — use `bash` instead.
 
 ## ONE COMMAND PER BASH CALL — ALWAYS
 
@@ -47,25 +51,54 @@ Use `"a"` to append. Use a new temp script name per write call.
 ## Part A — Source Map Decoding
 
 ### A1 — Find source maps
+
 ```bash
 find "<js_dir>" -type f -name "*.js.map" | sort
 ```
 
 ### A2 — Decode source maps
 
-Run the decoder for every .js.map file found:
-```bash
-node skills/decode-sourcemaps/decode-sourcemaps.js "<js_dir>" "<js_dir>"
+Load the skill first for usage notes and error-handling guidance:
+
+```
+skill(name="decode-sourcemaps")
 ```
 
-If the decoder script is missing, create it first using the script defined in `skills/decode-sourcemaps/SKILL.md`, then run it.
+Then verify the binary is available:
+
+```bash
+which sourcemapper || echo "NOT INSTALLED"
+```
+
+If installed, batch-decode all `.js.map` files found in A1:
+
+```bash
+cat > /tmp/sm_decode.sh << 'SHEOF'
+#!/bin/bash
+JS_DIR="<js_dir>"
+OUT_BASE="$JS_DIR/decoded-sources"
+mkdir -p "$OUT_BASE"
+find "$JS_DIR" -maxdepth 3 -name "*.js.map" | while read mapfile; do
+    relpath="${mapfile#$JS_DIR/}"
+    outname="${relpath//\//_}"
+    outname="${outname%.js.map}"
+    outdir="$OUT_BASE/$outname"
+    echo "[+] $relpath -> $outdir"
+    timeout 60 sourcemapper -url "$mapfile" -output "$outdir" 2>&1 | tail -3
+done
+SHEOF
+bash /tmp/sm_decode.sh
+```
+
+If `sourcemapper` is not installed, skip A2 entirely — Phase 2 and Phase 3 will run on the minified bundles. Note it in findings.
 
 After decoding:
+
 ```bash
 find "<js_dir>/decoded-sources" -type f 2>/dev/null | wc -l
 ```
 
-Decoded sources are placed in `<js_dir>/decoded-sources/` and will be available to Phase 2 and Phase 3 automatically. Store the count as `DECODED_COUNT`.
+Decoded sources land in `<js_dir>/decoded-sources/` and are picked up automatically by Phase 2 and Phase 3 via their recursive `find`/`grep` patterns. No extra configuration needed. Store the count as `DECODED_COUNT`.
 
 ---
 
@@ -93,30 +126,8 @@ Parse NDJSON output. For each finding record:
 
 ### B2 — Supplementary grep (always run)
 
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "sk-[a-zA-Z0-9]{20,}" "<js_dir>" 2>/dev/null | head -30
-```
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "pk_(live|test)_[a-zA-Z0-9]{20,}" "<js_dir>" 2>/dev/null | head -30
-```
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "AKIA[0-9A-Z]{16}" "<js_dir>" 2>/dev/null | head -30
-```
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}" "<js_dir>" 2>/dev/null | head -30
-```
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "xoxb-[0-9]+-[a-zA-Z0-9]+" "<js_dir>" 2>/dev/null | head -30
-```
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "AIza[0-9A-Za-z_-]{35}" "<js_dir>" 2>/dev/null | head -30
-```
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----" "<js_dir>" 2>/dev/null | head -10
-```
-```bash
-LC_ALL=C grep -rn --include="*.js" -E "(mongodb|postgres|mysql|redis)(\+srv)?://[^'\"\\s]+" "<js_dir>" 2>/dev/null | head -20
-```
+This is recon, not credential detection — TruffleHog (B1) is the sole source of truth for actual secrets/keys. Everything here finds a different class of signal entirely: scope-expansion hosts, JWT misconfiguration, and subdomain takeover candidates. Don't re-add credential-pattern regexes here (Stripe/AWS/GitHub/Slack/Google key shapes, private key headers, db connection strings, Sentry DSNs) — TruffleHog's own detectors already cover those with live verification, which a manual regex can't do anyway.
+
 ```bash
 LC_ALL=C grep -rn --include="*.js" -E "https?://[a-z0-9._-]+(staging|dev|uat|qa|internal|corp)\.[a-z]+" "<js_dir>" 2>/dev/null | head -20
 ```
@@ -124,14 +135,38 @@ LC_ALL=C grep -rn --include="*.js" -E "https?://[a-z0-9._-]+(staging|dev|uat|qa|
 LC_ALL=C grep -rn --include="*.js" -E "(s3|gs)://[a-zA-Z0-9._-]+" "<js_dir>" 2>/dev/null | head -20
 ```
 ```bash
-LC_ALL=C grep -rn --include="*.js" -E "https://[a-f0-9]+@(sentry\.io|[a-z0-9-]+\.ingest\.sentry\.io)" "<js_dir>" 2>/dev/null | head -20
-```
-```bash
 LC_ALL=C grep -rn --include="*.js" -E "process\.env\.[A-Z_]{4,}" "<js_dir>" 2>/dev/null | head -30
 ```
 ```bash
 LC_ALL=C grep -rn --include="*.js" -E "import\.meta\.env\.[A-Z_]{4,}" "<js_dir>" 2>/dev/null | head -20
 ```
+
+**JWT misconfiguration checks:**
+```bash
+LC_ALL=C grep -rn --include="*.js" -E ".alg.\s*:\s*.none.|algorithm.*.none.|alg.*.none." "<js_dir>" 2>/dev/null | head -20
+```
+```bash
+LC_ALL=C grep -rn --include="*.js" -E ".HS256.|.RS256.|.jwt." "<js_dir>" 2>/dev/null | head -20
+```
+```bash
+LC_ALL=C grep -rn --include="*.js" -E "(secret|signing.?key|jwt.?secret)\s*[=:]\s*['"][^'"]{3,60}['"]" "<js_dir>" 2>/dev/null | head -20
+```
+
+For the `alg:none` grep — any hit where the string appears in token creation/verification context is a CRITICAL finding. Add as a secret with `type: JWT_ALG_NONE`, `fp_risk: LOW`, `confirmed: false`.
+For the weak signing key grep — record any short or dictionary-word secret as a secret with `type: JWT_WEAK_SECRET`. Values like `secret`, `changeme`, `password`, `test`, `dev`, or strings under 16 chars are HIGH confidence.
+
+**Subdomain takeover signals:**
+```bash
+LC_ALL=C grep -rhn --include="*.js" -E "https?://[a-zA-Z0-9._-]+\.azurewebsites\.net|[a-zA-Z0-9._-]+\.github\.io|[a-zA-Z0-9._-]+\.s3\.amazonaws\.com|[a-zA-Z0-9._-]+\.cloudfront\.net|[a-zA-Z0-9._-]+\.herokuapp\.com|[a-zA-Z0-9._-]+\.fly\.dev|[a-zA-Z0-9._-]+\.pages\.dev" "<js_dir>" 2>/dev/null | sed "s|<js_dir>/||" | head -30
+```
+```bash
+LC_ALL=C grep -rhn --include="*.js" -E "[a-zA-Z0-9._-]+\.myshopify\.com|[a-zA-Z0-9._-]+\.azurefd\.net|[a-zA-Z0-9._-]+\.trafficmanager\.net|[a-zA-Z0-9._-]+\.blob\.core\.windows\.net" "<js_dir>" 2>/dev/null | sed "s|<js_dir>/||" | head -20
+```
+
+For each third-party infrastructure URL found, classify:
+- Is it a known dangling-CNAME-prone service? (azurewebsites, github.io, herokuapp, s3, cloudfront, fly.dev, pages.dev → YES)
+- Add as `env_references` entries with `type: TAKEOVER_CANDIDATE` and `notes: "Verify CNAME resolution — unclaimed = subdomain takeover"`.
+- Hunter action: `dig CNAME <subdomain>` then attempt registration on the provider.
 
 **Deduplication rules:**
 - If the same redacted value appears in both TruffleHog and grep output, keep TruffleHog entry only
@@ -169,6 +204,10 @@ If secrets already has entries — load into a seen set `(value_redacted, file, 
 ## Write to findings.json
 
 **You write JSON. The renderer generates Secrets.md. Zero markdown.**
+
+**STRICTLY FORBIDDEN:** Do NOT write `endpoints`, `idor_clusters`, `taint_paths`, or `base_url_map` keys. Those are owned by Phase 2 and Phase 3. If your grep output surfaces API paths while reading JS files, discard them — do not write them to findings.json. Writing endpoints here produces 100+ schema validation errors that block all downstream rendering.
+
+You write ONLY: `secrets`, `staging_urls`, `env_references`, and `meta.secrets_scan`.
 
 ### Schema
 
@@ -215,8 +254,14 @@ Each env reference object:
 cat > /tmp/sec_batch.py << 'PYEOF'
 import json, os
 
+# EVIDENCE DISCIPLINE: every secret/URL/env-ref below must come from an actual
+# TruffleHog or grep hit from this session — never inferred or guessed from
+# "this kind of app usually has X". If a grep pattern returned zero matches,
+# leave the corresponding list empty rather than inventing a plausible entry.
+
 path = "<output_dir>/findings.json"
 findings = json.load(open(path))
+original_keys = set(findings.keys())  # snapshot before modification
 
 # Build seen sets for deduplication
 seen_secrets = {(s["value_redacted"], s["file"], s["line"]) for s in findings.get("secrets", [])}
@@ -281,6 +326,12 @@ findings.setdefault("meta", {})["secrets_scan"] = {
     "unconfirmed_count": len([s for s in findings["secrets"] if not s.get("confirmed")]),
 }
 
+# Safety guard: never write Phase 2/3 keys — they cause schema validation errors
+for _fk in ("endpoints", "idor_clusters", "taint_paths", "base_url_map"):
+    if _fk in findings and _fk not in original_keys:
+        del findings[_fk]
+        print(f"GUARD: removed accidentally-added key '{_fk}' — belongs to Phase 2/3")
+
 with open(path, "w") as f:
     json.dump(findings, f, indent=2)
 print(f"Secrets batch done: {added_s} secrets, {added_u} staging_urls, {added_e} env_refs added")
@@ -296,11 +347,11 @@ If `new_secrets`, `new_staging_urls`, and `new_env_refs` are ALL empty — still
 ## Validate and Render
 
 ```bash
-python3 "<workflow_dir>/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --validate-only
+python3 "<workflow_dir>/.opencode/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --validate-only
 ```
 
 ```bash
-python3 "<workflow_dir>/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --only secrets
+python3 "<workflow_dir>/.opencode/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --only secrets
 ```
 
 Verify:
@@ -311,10 +362,15 @@ d = json.load(open('<output_dir>/findings.json'))
 secs = d.get('secrets', [])
 urls = d.get('staging_urls', [])
 md_size = os.path.getsize('<output_dir>/Secrets.md')
+scan_done = d.get('meta', {}).get('secrets_scan') is not None
 print(f'secrets: {len(secs)} ({len([s for s in secs if s.get(\"confirmed\")])} confirmed)')
 print(f'staging_urls: {len(urls)}')
 print(f'Secrets.md: {md_size} bytes')
-assert md_size >= 100, 'Secrets.md too small'
+# A clean scan with zero secrets is a valid, complete result -- the render
+# is only 33 bytes ('# Secrets\n\nNo secrets found.\n'). Do not gate on
+# md_size. meta.secrets_scan is written unconditionally and is the
+# authoritative signal that the scan actually completed.
+assert scan_done, 'meta.secrets_scan missing -- scan did not finish writing'
 print('PASS')
 "
 ```

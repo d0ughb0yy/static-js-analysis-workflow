@@ -1,6 +1,6 @@
 ---
 name: decode-sourcemaps
-description: Decode JavaScript source map files (.js.map) to recover original source code, filenames, and line mapping indexes for static analysis.
+description: Extract original JavaScript source trees from source map files using the sourcemapper binary. Handles .js.map files, inline data: sourcemap references, and JS files with embedded sourcemap URLs.
 license: MIT
 compatibility: opencode
 metadata:
@@ -11,66 +11,105 @@ metadata:
 
 ## What I do
 
-I parse JavaScript source map files (.js.map) and recover the original source code that was used to build minified bundles. This is essential for accurate bug bounty static analysis because:
+I use the `sourcemapper` binary (https://github.com/denandz/sourcemapper) to recover original source trees from webpack/bundler source maps. This is essential for static analysis because minified bundles have mangled names and collapsed whitespace — sourcemapper reconstructs the original file tree with real function names, comments, and module boundaries.
 
-- Minified bundles have meaningless variable names and no whitespace
-- Original sources reveal real function names, comments, and line numbers
-- Line mapping indexes let you trace findings back to original source locations
+Handles three input types:
+- `.js.map` files on disk (pass the file path as `-url`)
+- `.map` URLs (pass the URL as `-url`)
+- JS files with an embedded `sourceMappingURL` comment — including inline `data:` base64 blobs — (pass the JS URL or path as `-jsurl`)
 
-## Input
+## Prerequisites
 
-A directory containing `.js.map` files (typically alongside their `.js` bundles).
+`sourcemapper` must be installed on the host machine:
 
-## Output
+```bash
+go install github.com/denandz/sourcemapper@latest
+```
 
-For each source map decoded:
-- Original source files written to `decoded-sources/<bundle-name>/<original-filename>`
-- `mapping-index.json` containing generated line -> original line/column/name mappings
+Verify before running:
+
+```bash
+which sourcemapper || echo "NOT INSTALLED"
+sourcemapper -help 2>&1 | head -5
+```
+
+If not installed, skip decoding and note it — Phase 2 and Phase 3 will run on the minified bundles only (still functional, just lower signal quality).
 
 ## Usage
 
-Run the decoder via bash:
+### From local .js.map files (most common case)
 
 ```bash
-node .opencode/skills/decode-sourcemaps/decode-sourcemaps.js <input_dir> <output_dir>
+find "<js_dir>" -type f -name "*.js.map" | sort
 ```
 
-Or invoke this skill and the agent will run it automatically.
-
-## Dependencies
-
-Requires the `source-map` npm package:
+For each `.js.map` found, run:
 
 ```bash
-npm install source-map
+sourcemapper -url "<js_dir>/<name>.js.map" -output "<js_dir>/decoded-sources/<name>"
 ```
 
-## What the decoder produces
+Example batch run for all maps in a directory:
 
-Given `app.js.map`, the decoder creates:
+```bash
+cat > /tmp/sm_decode.sh << 'SHEOF'
+#!/bin/bash
+JS_DIR="<js_dir>"
+OUT_BASE="$JS_DIR/decoded-sources"
+mkdir -p "$OUT_BASE"
+find "$JS_DIR" -maxdepth 3 -name "*.js.map" | while read mapfile; do
+    relpath="${mapfile#$JS_DIR/}"
+    outname="${relpath//\//_}"
+    outname="${outname%.js.map}"
+    outdir="$OUT_BASE/$outname"
+    echo "[+] $relpath -> $outdir"
+    sourcemapper -url "$mapfile" -output "$outdir" 2>&1 | tail -3
+done
+SHEOF
+bash /tmp/sm_decode.sh
+```
+
+### From a JS file with embedded sourcemap reference
+
+When a `.js.map` file is not on disk but the JS file has a `sourceMappingURL` comment pointing to a URL or contains an inline `data:` blob:
+
+```bash
+sourcemapper -jsurl "https://example.com/assets/app.js" -output "<js_dir>/decoded-sources/app"
+```
+
+Add `-header "Cookie: session=..."` or `-header "Authorization: Bearer ..."` if the target requires authentication.
+
+Add `-insecure` if TLS cert is invalid.
+
+Add `-proxy "http://127.0.0.1:8080"` to route through Caido/Burp.
+
+## Output
+
+sourcemapper writes the recovered source tree to the output directory, preserving the original module paths from the sourcemap:
 
 ```
 decoded-sources/
-  app/
-    src/
-      components/
-        Login.tsx
-        Dashboard.tsx
-      utils/
-        api.ts
-        auth.ts
-    mapping-index.json
+  main/
+    webpack:/
+      src/
+        components/
+          Login.tsx
+          Dashboard.tsx
+        utils/
+          api.ts
+          auth.ts
 ```
 
-The `mapping-index.json` maps generated lines (from the minified bundle) back to original lines:
+After running, record the count:
 
-```json
-{
-  "src/components/Login.tsx": {
-    "45": [{"originalLine": 12, "originalColumn": 4, "name": "handleLogin"}],
-    "46": [{"originalLine": 13, "originalColumn": 8, "name": null}]
-  }
-}
+```bash
+find "<js_dir>/decoded-sources" -type f 2>/dev/null | wc -l
 ```
 
-This lets other agents report findings as `src/components/Login.tsx:12` instead of `app.js:45`.
+Decoded sources are automatically picked up by Phase 2 (api-mapper) and Phase 3 (taint-analyzer) since they scan `<js_dir>` recursively. No extra configuration needed.
+
+## When decoding fails
+
+- `no sourcemap found` — the JS file has no `sourceMappingURL` comment and no `.js.map` exists — skip, analysis proceeds on minified bundle
+- `invalid JSON` — corrupted or truncated map file — skip this file, continue with others
+- sourcemapper hangs (>60s) — kill and skip: `timeout 60 sourcemapper ...`

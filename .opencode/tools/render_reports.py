@@ -23,11 +23,11 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 REQUIRED_ENDPOINT_FIELDS = {"method", "path", "file", "line", "flags", "bb_potential", "first_test", "category", "ep_type"}
-REQUIRED_TAINT_FIELDS = {"id", "source_type", "sink_type", "source_file", "source_line", "sink_file", "sink_line", "confidence", "estimated_bounty"}
+REQUIRED_TAINT_FIELDS = {"id", "source_type", "sink_type", "source_file", "source_line", "sink_file", "sink_line", "confidence", "sanitizer"}
 REQUIRED_SECRET_FIELDS = {"type", "file", "line", "value_redacted", "confirmed"}
 VALID_BB_POTENTIAL = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
 VALID_CONFIDENCE = {"CONFIRMED", "INFERRED", "BLOCKED"}
-VALID_FLAGS = {"IDOR", "ADMIN", "UPLOAD", "REDIRECT", "AUTH", "EXPORT", "WEBSOCKET", "GRAPHQL"}
+VALID_FLAGS = {"IDOR", "ADMIN", "UPLOAD", "REDIRECT", "AUTH", "EXPORT", "WEBSOCKET", "GRAPHQL", "CORS"}
 VALID_CATEGORIES = {
     "Auth & Identity", "Admin & Internal", "Data & Content",
     "File Upload / Export", "Billing & Payment",
@@ -70,8 +70,6 @@ def validate_taint(tp: dict, idx: int) -> list[str]:
         errors.append(f"taint_path[{idx}] missing fields: {missing}")
     if tp.get("confidence") not in VALID_CONFIDENCE:
         errors.append(f"taint_path[{idx}] invalid confidence: {tp.get('confidence')}")
-    if tp.get("estimated_bounty") not in VALID_BB_POTENTIAL:
-        errors.append(f"taint_path[{idx}] invalid estimated_bounty: {tp.get('estimated_bounty')}")
     return errors
 
 def validate_findings(findings: dict) -> list[str]:
@@ -186,6 +184,30 @@ def render_endpoints(findings: dict, host_map: dict = None) -> str:
     if not endpoints:
         return "# Endpoints\n\nNo endpoints extracted.\n"
 
+    program_intel = findings.get("meta", {}).get("program_intel", {})
+    out_of_scope_hosts = set(program_intel.get("out_of_scope_hosts", []) or [])
+    dupe_risk_by_class = program_intel.get("dupe_risk_by_class", {}) or {}
+
+    # Flags map onto the same vuln-class taxonomy prior-art-lookup uses, so the
+    # dupe-risk column is a pure join — no model ever has to compute this itself.
+    FLAG_TO_VULN_CLASS = {
+        "IDOR": "IDOR", "AUTH": "AUTH_BYPASS", "REDIRECT": "OPEN_REDIRECT",
+        "EXPORT": "INFO_DISCLOSURE", "GRAPHQL": "IDOR", "CORS": "AUTH_BYPASS",
+    }
+
+    def dupe_risk_for(ep: dict) -> str:
+        best = None
+        order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NOVEL": 3, "UNKNOWN": 4}
+        for flag in ep.get("flags", []):
+            vuln = FLAG_TO_VULN_CLASS.get(flag)
+            risk = dupe_risk_by_class.get(vuln) if vuln else None
+            if risk and (best is None or order.get(risk, 4) < order.get(best, 4)):
+                best = risk
+        return best or "UNKNOWN"
+
+    def is_out_of_scope(ep: dict) -> bool:
+        return file_host(ep.get("file", "")) in out_of_scope_hosts
+
     # Sort by bb_potential then file then path
     endpoints = sorted(endpoints, key=lambda e: (
         BB_POTENTIAL_ORDER.get(e.get("bb_potential", "INFO"), 99),
@@ -195,9 +217,43 @@ def render_endpoints(findings: dict, host_map: dict = None) -> str:
 
     lines = ["# Endpoints\n"]
 
+    # --- Program Intel ---
+    if program_intel:
+        lines.append("## Program Intel\n")
+        lines.append(f"- Platform: {program_intel.get('platform') or 'UNKNOWN'}")
+        lines.append(f"- Program: {program_intel.get('program_name') or 'UNKNOWN'}")
+        lines.append(f"- Offers bounties: {program_intel.get('offers_bounties', 'UNKNOWN')}")
+        if out_of_scope_hosts:
+            lines.append(f"- Out-of-scope hosts: {', '.join(sorted(out_of_scope_hosts))}")
+        if dupe_risk_by_class:
+            risk_str = ", ".join(f"{k}={v}" for k, v in sorted(dupe_risk_by_class.items()))
+            lines.append(f"- Dupe risk by class: {risk_str}")
+        lines.append("")
+
+    # --- IDOR Clusters ---
+    idor_clusters = findings.get("idor_clusters", [])
+    if idor_clusters:
+        lines.append("## IDOR Clusters\n")
+        lines.append("> One recommended test target per attack surface, not per endpoint — if one IDOR works, the whole prefix likely shares the same middleware.\n")
+        lines.append("| Priority | Host + Prefix | Endpoints | ID Type | Test This | Methods |")
+        lines.append("|----------|---------------|-----------|---------|-----------|---------|")
+        for c in idor_clusters:
+            if not c.get("has_viable_primary"):
+                continue
+            if c.get("host", "") in out_of_scope_hosts:
+                continue
+            primaries = ", ".join(f"`{p}`" for p in c.get("viable_primaries", []))
+            lines.append(
+                f"| {c.get('max_potential','?')} | {c.get('host','?')}{c.get('prefix','')} | "
+                f"{c.get('endpoint_count','?')} | {c.get('id_type','?')} | {primaries} | "
+                f"{', '.join(c.get('methods', []))} |"
+            )
+        lines.append("")
+
     # --- Top 10 ---
     server_eps = [e for e in endpoints if e.get("ep_type", "server") == "server"]
-    top10 = sorted(server_eps, key=lambda e: (
+    top10_candidates = [e for e in server_eps if not is_out_of_scope(e)]
+    top10 = sorted(top10_candidates, key=lambda e: (
         BB_POTENTIAL_ORDER.get(e.get("bb_potential", "INFO"), 99),
         0 if e.get("single_request_test") else 1,
         e.get("file", ""),
@@ -298,15 +354,18 @@ def render_endpoints(findings: dict, host_map: dict = None) -> str:
             e.get("path", "")
         ))
         lines.append(f"## {cat}\n")
-        lines.append("| Method | Path | File | Line | Flags | BB Potential | Prior Art | First Test |")
+        lines.append("| Method | Path | File | Line | Flags | BB Potential | Dupe Risk | First Test |")
         lines.append("|--------|------|------|------|-------|-------------|-----------|------------|")
         for ep in eps:
             flags = ", ".join(ep.get("flags", [])) or "—"
-            prior_art = ep.get("prior_art", "UNKNOWN")
+            dupe_risk = dupe_risk_for(ep)
+            first_test = ep.get('first_test','?')
+            if is_out_of_scope(ep):
+                first_test = f"⛔ OUT OF SCOPE — do not test. {first_test}"
             lines.append(
                 f"| {ep.get('method','?')} | `{ep.get('path','?')}` | "
                 f"{ep.get('file','?')} | {ep.get('line','?')} | "
-                f"{flags} | {ep.get('bb_potential','?')} | {prior_art} | {ep.get('first_test','?')} |"
+                f"{flags} | {ep.get('bb_potential','?')} | {dupe_risk} | {first_test} |"
             )
         lines.append("")
 
@@ -372,16 +431,17 @@ def render_taint(findings: dict, host_map: dict = None) -> str:
     # --- Top Findings ---
     confirmed = [tp for tp in taint_paths if tp["confidence"] == "CONFIRMED"]
     inferred = [tp for tp in taint_paths if tp["confidence"] == "INFERRED"]
+    CONF_ORDER = {"CONFIRMED": 0, "INFERRED": 1}
     top = sorted(confirmed + inferred,
-                 key=lambda t: (BB_POTENTIAL_ORDER.get(t["estimated_bounty"], 99), t["id"]))
+                 key=lambda t: (CONF_ORDER.get(t["confidence"], 9), t["id"]))
 
     lines.append("## Top Findings\n")
-    lines.append("> Ranked by hunter value. Synthesis builds chains from this section first.\n")
-    lines.append("| Rank | Finding | Confidence | Estimated Bounty | File | Line |")
-    lines.append("|------|---------|------------|-----------------|------|------|")
+    lines.append("> Source-to-sink paths where user input reaches a dangerous sink, ranked by confidence.\n")
+    lines.append("| Rank | Finding | Confidence | Sanitizer | File | Line |")
+    lines.append("|------|---------|------------|-----------|------|------|")
     for i, tp in enumerate(top, 1):
         summary = tp.get("summary", f"{tp['source_type']} → {tp['sink_type']}")
-        lines.append(f"| {i} | {summary} | {tp['confidence']} | {tp['estimated_bounty']} | {tp['source_file']} | {tp['source_line']} |")
+        lines.append(f"| {i} | {summary} | {tp['confidence']} | {tp.get('sanitizer', 'None')} | {tp['source_file']} | {tp['source_line']} |")
     lines.append("")
 
     # --- Summary ---
@@ -434,32 +494,9 @@ def render_taint(findings: dict, host_map: dict = None) -> str:
             lines.append(f"Confidence: {tp['confidence']}")
             lines.append(f"Risk: {tp.get('risk_description', '—')}")
             lines.append("")
-            mt = tp.get("manual_test", "")
-            if mt:
-                lines.append("**Manual test:**")
-                lines.append("```")
-                lines.append(mt)
-                lines.append("```")
-                lines.append("")
-            lines.append(f"Submission Ready: {tp.get('submission_ready', 'NO')} — needs: {tp.get('submission_blocker', 'see risk description')}")
-            lines.append(f"Estimated Bounty: {tp['estimated_bounty']}")
-            lines.append(f"Prior Art: {tp.get('prior_art', 'UNKNOWN')}")
-            lines.append("")
-            dt = tp.get("debugger_trace")
-            if dt and tp.get("confidence") in ("CONFIRMED", "INFERRED"):
-                steps = dt.get("steps", [])
-                if steps:
-                    lines.append("**Debugger trace:**")
-                    lines.append("")
-                    for i, step in enumerate(steps, 1):
-                        lines.append(f"{i}. {step}")
-                    lines.append("")
-                trigger = dt.get("trigger_action", "")
-                exploit = dt.get("exploitation_step", "")
-                if trigger:
-                    lines.append(f"Trigger: `{trigger}`")
-                if exploit:
-                    lines.append(f"Exploitation: `{exploit}`")
+            verify = tp.get("how_to_verify", "")
+            if verify:
+                lines.append(f"How to verify: {verify}")
                 lines.append("")
             lines.append("\n---\n")
 
@@ -516,8 +553,12 @@ def render_taint(findings: dict, host_map: dict = None) -> str:
     sc = findings.get("security_components", {})
     if sc:
         lines.append("## Security Components\n")
+
+        any_defense = False
+
         dp = sc.get("dompurify", {})
         if dp.get("present"):
+            any_defense = True
             cve_str = ", ".join(dp.get("cves", [])) or "none"
             overrides = ", ".join(dp.get("config_overrides", [])) or "none"
             lines.append(f"**DOMPurify** v{dp.get('version','UNKNOWN')} — CVE risk: `{dp.get('cve_risk','UNKNOWN')}` — CVEs: {cve_str}")
@@ -525,23 +566,59 @@ def render_taint(findings: dict, host_map: dict = None) -> str:
             if dp.get("notes"):
                 lines.append(f"Notes: {dp['notes']}")
             lines.append("")
-        else:
-            lines.append("**DOMPurify:** not detected — all innerHTML/dangerouslySetInnerHTML sinks are unmitigated")
-            lines.append("")
+
         for s in sc.get("other_sanitizers", []):
+            any_defense = True
             lines.append(f"**{s.get('name','?')}** — {s.get('file','?')}:{s.get('line','?')} — {s.get('notes','')}")
+        if sc.get("other_sanitizers"):
+            lines.append("")
+
         filters = sc.get("hardcoded_filters", [])
         if filters:
-            lines.append("")
+            any_defense = True
             lines.append(f"**Hardcoded filters:** {len(filters)}")
             lines.append("| Type | Scope | Case sensitive | Action | Bypass notes |")
             lines.append("|------|-------|---------------|--------|-------------|")
             for f in filters:
                 lines.append(f"| {f.get('type','?')} | {f.get('scope','?')} | {f.get('case_sensitive','?')} | {f.get('action','?')} | {f.get('bypass_notes','—')} |")
-        if sc.get("trusted_types"):
             lines.append("")
+
+        if sc.get("trusted_types"):
+            any_defense = True
             lines.append("**Trusted Types:** enforced — XSS requires policy bypass")
-        lines.append("")
+            lines.append("")
+
+        for a in sc.get("angular_trust_bypass", []):
+            any_defense = True
+            lines.append(f"**Angular bypassSecurityTrust{a.get('type','?')}** — {a.get('file','?')}:{a.get('line','?')} — opt-out of Angular sanitizer, trace input")
+        if sc.get("angular_trust_bypass"):
+            lines.append("")
+
+        domparser = sc.get("domparser_misuse", [])
+        if domparser:
+            lines.append(f"**DOMParser misuse (false sanitizer):** {len(domparser)} occurrence(s) — DOMParser.parseFromString does NOT sanitize, sinks through here remain CONFIRMED")
+            for d in domparser:
+                lines.append(f"  - {d.get('file','?')}:{d.get('line','?')}")
+            lines.append("")
+
+        if sc.get("cookie_readable"):
+            lines.append("**Cookies:** `document.cookie` readable — auth cookies are NOT HttpOnly, any confirmed XSS path upgrades to session theft")
+            lines.append("")
+
+        if not any_defense:
+            lines.append("No sanitizers, security libraries, Trusted Types, or hardcoded filters detected.")
+            lines.append("All innerHTML / dangerouslySetInnerHTML / eval sinks are unmitigated.")
+            lines.append("")
+
+        csp = sc.get("csp_enforcement", "UNKNOWN")
+        if csp != "UNKNOWN":
+            lines.append(f"CSP enforcement: **{csp}**")
+            lines.append("")
+
+        if sc.get("notes"):
+            lines.append(f"Notes: {sc['notes']}")
+            lines.append("")
+
     elif findings.get("sanitizers"):
         # Legacy fallback
         sanitizers = findings["sanitizers"]
@@ -596,57 +673,6 @@ def render_secrets(findings: dict, host_map: dict = None) -> str:
         lines.append("|----------|------|------|")
         for r in env_refs:
             lines.append(f"| `{r.get('variable','—')}` | {r.get('file','—')} | {r.get('line','—')} |")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def render_bbcontext(findings: dict, host_map: dict = None) -> str:
-    ctx = findings.get("bb_context", {})
-    if not ctx:
-        return "# Bug Bounty Context\n\nNo context available — Phase 0 did not run or target has no program.\n"
-
-    lines = ["# Bug Bounty Context\n"]
-
-    # Program info
-    lines.append("## Program Info\n")
-    lines.append(f"- Platform: {ctx.get('platform', 'UNKNOWN')}")
-    lines.append(f"- Program: {ctx.get('program_name', 'UNKNOWN')}")
-    if ctx.get('program_url'):
-        lines.append(f"- URL: {ctx.get('program_url')}")
-    lines.append(f"- Type: {ctx.get('program_type', 'UNKNOWN')}")
-    lines.append(f"- Offers bounties: {ctx.get('offers_bounties', 'UNKNOWN')}")
-    lines.append("")
-
-    # Prior art map
-    prior_art = ctx.get("prior_art_map", [])
-    if prior_art:
-        lines.append("## Prior Art Map\n")
-        lines.append("| Vuln Class | Report Count | Dupe Risk |")
-        lines.append("|------------|--------------|-----------|")
-        for row in prior_art:
-            lines.append(f"| {row.get('vuln_class','—')} | {row.get('report_count','—')} | {row.get('dupe_risk','—')} |")
-        lines.append("")
-    else:
-        lines.append("## Prior Art Map\n")
-        lines.append("No prior art data available — all dupe risk UNKNOWN.\n")
-
-    # Out-of-scope vuln classes (new field name)
-    exclusions = ctx.get("out_of_scope_vuln_classes", ctx.get("out_of_scope", []))
-    if exclusions:
-        lines.append("## Out-of-Scope Vuln Classes\n")
-        for ex in exclusions:
-            lines.append(f"- {ex}")
-        lines.append("")
-
-    # Kill list seeds
-    kill_seeds = ctx.get("kill_list_seeds", [])
-    if kill_seeds:
-        lines.append("## Kill List Seeds\n")
-        lines.append("| Item | Reason |")
-        lines.append("|------|--------|")
-        for k in kill_seeds:
-            lines.append(f"| {k.get('item','—')} | {k.get('reason','—')} |")
         lines.append("")
 
     return "\n".join(lines)
@@ -721,7 +747,6 @@ def main():
         "endpoints": ("Endpoints.md", lambda: render_endpoints(findings, host_map)),
         "taint": ("Taint.md", lambda: render_taint(findings, host_map)),
         "secrets": ("Secrets.md", lambda: render_secrets(findings)),
-        "bbcontext": ("BBContext.md", lambda: render_bbcontext(findings)),
     }
 
     to_render = list(renders.keys()) if args.only == "all" else [args.only]

@@ -4,8 +4,16 @@
     "external_directory": {
       "/tmp/**": "allow",
       "/tmp/": "allow",
-      "/tmp/*": "allow"
+      "/tmp/*": "allow",
     },
     "websearch": "allow"
+  },
+  "provider": {
+    "nvidia": {
+      "options": {
+        "timeout": 600000,
+        "chunkTimeout": 600000
+      }
+    }
   }
 }

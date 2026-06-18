@@ -23,8 +23,14 @@ Think like a hunter throughout. When you find an endpoint, don't just record it 
 ## Input
 
 - `JS files directory:` — path to JS files (`<js_dir>`)
-- `Output file:` — path to write Endpoints.md
+- `Output directory:` — path to the output directory containing findings.json
+- `Workflow directory:` — the **project root** — the parent directory that *contains* `.opencode/` (so `.opencode/tools/render_reports.py` and `.opencode/skills/` both live under it). NOT `.opencode/` itself.
+- `Target name:` — human-readable target name (e.g. `MyFitnessPal`)
 - `[HUNTER CONTEXT]` *(optional)* — hunter-provided notes about this target. Read carefully before starting. Apply any domain mappings, architecture notes, or special context when naming endpoints and assigning BB Potential. For example: `"*.cdn-assets.example.com domains correspond to *.api.example.com"` means an endpoint found in `cdn-assets.example.com` JS should be attributed to `api.example.com` in the output.
+
+## Available Tools — Exact List, No Substitutes
+
+This agent runs on a model that sometimes invents tool names from its training distribution that do not exist in this environment. The only tools available are: `bash`, `read`, `glob`, `grep`, `skill`. There is no `ls`, `create_file`, `write`, `edit`, `cat`, `find` (as standalone tools — these are shell commands, not tools), `task`, `webfetch`, or any other tool name. **Every filesystem operation that isn't covered by `read`/`glob`/`grep` goes through `bash`** — e.g. listing a directory is `bash` running `ls -la <path>`, not a standalone `ls` tool call. If you are about to call a tool and you are not certain it is in the list above, it does not exist — use `bash` instead.
 
 ## ONE COMMAND PER BASH CALL — ALWAYS
 
@@ -34,7 +40,7 @@ Regex patterns that contain both `'` and `"` will cause `unexpected EOF` if used
 
 ```bash
 # WRONG — bash sees the ' inside the pattern and terminates the string early
-LC_ALL=C grep -rn -E "baseURL\s*[:=]\s*['"]https?://" "<js_dir>"
+LC_ALL=C grep -rn -E "baseURL\s*[:=]\s*.https?://" "<js_dir>"
 
 # CORRECT — assign regex to variable, use -e flag
 p='baseURL[[:space:]]*[:=][[:space:]]*['"'"'"]https://'; LC_ALL=C grep -rn --include="*.js" -e "$p" "<js_dir>" 2>/dev/null
@@ -119,6 +125,25 @@ LC_ALL=C grep -rn --include="*.js" -E "navigate\(['\"/]" "<js_dir>" 2>/dev/null
 LC_ALL=C grep -rn --include="*.js" -E "window\.location\.(href|assign|replace)\s*=" "<js_dir>" 2>/dev/null
 ```
 
+### Set B2 — CORS credential signals
+
+```bash
+LC_ALL=C grep -rn --include="*.js" -E "credentials\s*:\s*.include.|withCredentials\s*:\s*true" "<js_dir>" 2>/dev/null | sed "s|<js_dir>/||"
+```
+
+For each hit, read ±5 lines to identify which fetch/axios call it belongs to. Tag the matching endpoint with flag `CORS` — if that endpoint also has `IDOR`, this is a potential cross-origin data theft chain.
+
+### Set B3 — Feature flag gating (client-side auth bypass signals)
+
+```bash
+LC_ALL=C grep -rn --include="*.js" -E "(checkGate|isFeatureEnabled|variation|featureFlag)\s*\(.*\)\s*(&&|\?|===)" "<js_dir>" 2>/dev/null | sed "s|<js_dir>/||" | head -40
+```
+```bash
+LC_ALL=C grep -rn --include="*.js" -E "ldClient\.(variation|allFlags)|statsig\.checkGate|LaunchDarkly|unleash\.(isEnabled|getVariant)" "<js_dir>" 2>/dev/null | sed "s|<js_dir>/||" | head -30
+```
+
+For each hit, read ±10 lines to see if the gated block makes an API call or unlocks UI. If yes, tag the endpoint in that block with `FEATUREGATE`.
+
 ### Set C — GraphQL detection
 
 ```bash
@@ -133,6 +158,8 @@ LC_ALL=C grep -rn --include="*.js" -E "/graphql|graphql_url|GRAPHQL_URL" "<js_di
 ## Step 2 — Auth Signals Pass
 
 Run these as separate bash calls. Results feed the `## Auth Signals` output section — they are NOT endpoints but are high-value security findings.
+
+**⛔ EVIDENCE DISCIPLINE — every entry below must trace to an actual grep hit you saw in this session.** Never write an `auth_signals` entry based on inference, pattern-matching from memory, or "this is the kind of thing apps usually do." If a grep command below returns zero matches, the corresponding array stays empty — do not invent a plausible-looking key/file/line to fill it. A fabricated finding with a precise-looking line number is worse than an honest empty array, because it looks verified when it isn't. Before writing any entry, you must be able to point to the exact grep output line that produced it.
 
 **Token storage:**
 ```bash
@@ -235,18 +262,20 @@ Apply flags to every server API row:
 
 | Flag | Condition |
 |------|-----------|
-| `IDOR` | Path or param contains `id`, `user_id`, `account_id`, `order_id`, `file_id`, `record_id` |
+| `IDOR` | Path contains a **structural** resource identifier: a named placeholder (`:id`, `:userId`, `{accountId}`), a bare numeric segment (e.g. `/users/123/`), a UUID segment, OR a query param that when you read ±5 lines around the endpoint is **named exactly** `id`, `user_id`, `account_id`, `order_id`, `file_id`, `record_id`, `doc_id`, `page_id`. **Explicit negative list — NEVER flag these paths as IDOR regardless of any substring match:** `/api/auth/session`, `/api/auth/refresh-token-data`, `/api/services/account/*` (settings endpoints with no ID param), `/api/services/users` (flat, no ID), `/api/services/paid-subscriptions` (flat, no ID), `/api/services/friends/list`, `/api/services/blocked_users`, and any path whose every segment is a noun with no `:param`, `{param}`, numeric, UUID, or ALL_CAPS_ID present. The path must have a concrete resource-ownership boundary where swapping an identifier gives a different user's resource. |
 | `ADMIN` | Path contains `admin`, `internal`, `debug`, `metrics`, `healthz` |
 | `UPLOAD` | Path contains `upload`, `import`, `file`, `avatar`, `image`, `document`, `attachment` |
 | `REDIRECT` | Query param `redirect`, `return`, `next`, `url`, `target`, `callback`, `continue` |
 | `AUTH` | Path contains `login`, `logout`, `register`, `auth`, `token`, `refresh`, `oauth`, `sso` |
 | `EXPORT` | Path contains `export`, `download`, `backup`, `report` |
+| `CORS` | Endpoint call includes `credentials: 'include'` or `withCredentials: true` in the same code block |
+| `FEATUREGATE` | Access conditioned only on a client-side feature flag (LaunchDarkly, Statsig, etc.) with no visible server-side enforcement |
 
 ---
 
 ## Step 5b — Tech-Context Enrichment
 
-When writing endpoint objects, add a `tech_context` field when you recognize a known third-party API pattern in the path. This gives the synthesis agent the raw material to write precise manual tests instead of generic ones.
+When writing endpoint objects, add a `tech_context` field when you recognize a known third-party API pattern in the path. This gives the rendered output the raw material for precise manual tests instead of generic ones.
 
 **Apply these mappings** (match on path prefix, set `tech_context` on the endpoint object):
 
@@ -326,7 +355,6 @@ Each endpoint object:
   "line": 15110,
   "flags": ["AUTH"],
   "bb_potential": "CRITICAL",
-  "prior_art": "UNKNOWN",
   "first_test": "Test PKCE bypass — send code_challenge_method=plain",
   "category": "Auth & Identity",
   "ep_type": "server",
@@ -336,12 +364,14 @@ Each endpoint object:
 }
 ```
 
-Required fields: `method`, `path`, `file`, `line`, `flags`, `bb_potential`, `first_test`, `category`, `ep_type`.
+Required fields: `method`, `path`, `file`, `line`, `flags`, `bb_potential`, `first_test`, `category`, `ep_type`. Do not add a `prior_art` field — the renderer computes a dupe-risk column itself from `meta.program_intel`, written separately by `js-discovery`.
 
-Valid `category` values (use exactly these strings):
+Valid `category` values — **use EXACTLY these strings, nothing else**:
 `"Auth & Identity"`, `"Admin & Internal"`, `"Data & Content"`, `"File Upload / Export"`, `"Billing & Payment"`, `"Pub/Sub, Realtime & Promotions"`, `"Integrations & Webhooks"`, `"WebSocket"`, `"GraphQL"`, `"Uncategorized"`, `"Base URLs & Environment Variables"`, `"Client Routes"`
 
-Valid `ep_type` values: `"server"`, `"client_route"`, `"websocket"`, `"graphql"`
+**NEVER use:** `"API"`, `"Authentication"`, `"Endpoint"`, `"General"`, `"Other"`, or any value not in the list above. The renderer will reject the entire output with schema errors if any category is invalid.
+
+Valid `ep_type` values — **use EXACTLY these strings**: `"server"`, `"client_route"`, `"websocket"`, `"graphql"`
 
 ### Resume Guard
 
@@ -360,11 +390,48 @@ print(f'RESUME: {len(eps)} endpoints already extracted')
 "
 ```
 
-If `RESUME: N endpoints` with N > 0 — the file has data. Load existing endpoints into your `seen` set and append only new findings. Do NOT overwrite.
+If `RESUME: N endpoints` with N == 0 — the orchestrator already pre-initialized this file (possibly with `meta.program_intel` from js-discovery). Treat this exactly like `START_FRESH`: proceed to Step 6, which merges into the existing file rather than overwriting it.
+
+If `RESUME: N endpoints` with N > 0 — check if the existing endpoints are valid before resuming:
+
+```bash
+cat > /tmp/ep_validate_existing.py << 'PYEOF'
+import json
+VALID_CATEGORIES = {
+    "Auth & Identity", "Admin & Internal", "Data & Content",
+    "File Upload / Export", "Billing & Payment", "Pub/Sub, Realtime & Promotions",
+    "Integrations & Webhooks", "WebSocket", "GraphQL", "Uncategorized",
+    "Base URLs & Environment Variables", "Client Routes"
+}
+VALID_EP_TYPES = {"server", "client_route", "websocket", "graphql"}
+REQUIRED_FIELDS = {"method", "path", "file", "line", "flags", "bb_potential", "first_test", "category", "ep_type"}
+
+path = "<output_dir>/findings.json"
+findings = json.load(open(path))
+eps = findings.get("endpoints", [])
+invalid = [e for e in eps if
+    e.get("category") not in VALID_CATEGORIES or
+    e.get("ep_type") not in VALID_EP_TYPES or
+    not REQUIRED_FIELDS.issubset(e.keys())]
+if invalid:
+    print(f"INVALID: {len(invalid)}/{len(eps)} endpoints have wrong schema (bad category, ep_type, or missing fields)")
+    print(f"  Examples: {[e.get('category','MISSING') for e in invalid[:5]]}")
+    print("PURGING invalid endpoints — Phase 1 wrote endpoints it should not have")
+    findings["endpoints"] = [e for e in eps if e not in invalid]
+    with open(path, "w") as f:
+        json.dump(findings, f, indent=2)
+    print(f"Purged. {len(findings['endpoints'])} valid endpoints remain. Proceeding as START_FRESH for endpoint extraction.")
+else:
+    print(f"OK: all {len(eps)} existing endpoints are valid — RESUME mode")
+PYEOF
+python3 /tmp/ep_validate_existing.py
+```
+
+If the script prints `PURGING` — treat findings.json as START_FRESH for endpoint extraction (the other data like secrets/staging_urls is preserved). If it prints `RESUME mode` — load existing endpoints into your `seen` set and append only new findings.
 
 If `START_FRESH` — initialize the findings.json structure, then extract.
 
-### Step 6 — Initialize findings.json (only if START_FRESH)
+### Step 6 — Initialize/Merge findings.json Structure
 
 ```bash
 cat > /tmp/ep_init.py << 'PYEOF'
@@ -373,44 +440,119 @@ from datetime import datetime
 
 path = "<output_dir>/findings.json"
 
-# Never overwrite a non-empty file
+# findings.json is now always pre-initialized by the orchestrator (and possibly
+# already has meta.program_intel from js-discovery) — merge in, never overwrite.
 if os.path.exists(path):
     existing = json.load(open(path))
     if existing.get("endpoints"):
         print(f"SKIP: findings.json already has {len(existing['endpoints'])} endpoints")
         exit(0)
+    findings = existing
+else:
+    findings = {"schema_version": 1, "meta": {}}
 
-findings = {
-    "schema_version": 1,
-    "meta": {
-        "target": "<target_name>",
-        "js_dir": "<js_dir>",
-        "scan_date": datetime.utcnow().isoformat(),
-        "phase": "api_mapping"
-    },
-    "endpoints": [],
-    "auth_signals": {
-        "Token Storage": [],
-        "JWT Issues": [],
-        "OAuth / OIDC Signals": [],
-        "Client-Side Role Checks": [],
-        "Debug & Feature Flag Branches": [],
-        "Client-Side Price Controls": []
-    },
-    "evidence_gaps": [],
-    "taint_paths": [],
-    "secrets": [],
-    "staging_urls": [],
-    "env_references": [],
-    "bb_context": {},
-    "attack_chains": []
-}
+findings["meta"]["target"] = "<target_name>"
+findings["meta"]["js_dir"] = "<js_dir>"
+findings["meta"]["scan_date"] = datetime.utcnow().isoformat()
+findings["meta"]["phase"] = "api_mapping"
+findings.setdefault("endpoints", [])
+findings.setdefault("auth_signals", {
+    "Token Storage": [],
+    "JWT Issues": [],
+    "OAuth / OIDC Signals": [],
+    "Client-Side Role Checks": [],
+    "Debug & Feature Flag Branches": [],
+    "Client-Side Price Controls": []
+})
+findings.setdefault("evidence_gaps", [])
+findings.setdefault("taint_paths", [])
+findings.setdefault("secrets", [])
+findings.setdefault("staging_urls", [])
+findings.setdefault("env_references", [])
 with open(path, "w") as f:
     json.dump(findings, f, indent=2)
 print(f"findings.json initialized: {os.path.getsize(path)} bytes")
 PYEOF
 python3 /tmp/ep_init.py
 ```
+
+### Step 6b — Grep-First Raw Endpoint Dump
+
+**Run immediately after all grep passes complete, before any enrichment.** Write every path found by grep to findings.json with minimal fields. This guarantees 100% path coverage even if enrichment is cut short by context exhaustion.
+
+```bash
+cat > /tmp/ep_raw_dump.py << 'PYEOF'
+import json, re, os
+
+findings_path = "<output_dir>/findings.json"
+findings = json.load(open(findings_path))
+seen = {(e["method"], e["path"]) for e in findings["endpoints"]}
+
+# Paste ALL paths extracted from grep output here — one per line, with method if known.
+# Format: ("METHOD", "/path/to/endpoint", "relative/file/path.js", line_number)
+# Use ("GET", path, file, 0) if method unknown — enrichment in Step 7 will correct it.
+RAW_PATHS = [
+    # ("GET",  "/api/services/diary/read_day", "cdn.example.com/assets/app.js", 12345),
+    # ("POST", "/api/auth/signin",             "cdn.example.com/assets/app.js", 67890),
+]
+
+added = 0
+for method, path, file, line in RAW_PATHS:
+    key = (method, path)
+    if key not in seen:
+        seen.add(key)
+        findings["endpoints"].append({
+            "method":   method,
+            "path":     path,
+            "file":     file,
+            "line":     line,
+            "flags":    [],
+            "bb_potential": "INFO",
+            "first_test":   "Verify endpoint exists",
+            "category":     "Uncategorized",
+            "ep_type":      "server",
+            "notes":        "raw — pending enrichment in Step 7"
+        })
+        added += 1
+
+# Write scan_manifest: record every JS file the grep touched
+all_files = [t[2] for t in RAW_PATHS]
+unique_files = sorted(set(f for f in all_files if f))
+findings.setdefault("meta", {})["scan_manifest"] = {
+    "total_js_files": len(unique_files),
+    "files_with_endpoints": unique_files,
+    "raw_dump_done": True,
+    "enrichment_done": False,
+}
+
+with open(findings_path, "w") as f:
+    json.dump(findings, f, indent=2)
+print(f"Raw dump: {added} new paths written ({len(findings['endpoints'])} total)")
+print(f"scan_manifest: {len(unique_files)} files covered")
+PYEOF
+python3 /tmp/ep_raw_dump.py
+```
+
+**After raw dump — checkpoint:**
+```bash
+cat > /tmp/ep_raw_check.py << 'PYEOF'
+import json
+d = json.load(open("<output_dir>/findings.json"))
+eps = d.get("endpoints", [])
+manifest = d.get("meta", {}).get("scan_manifest", {})
+print(f"Raw endpoints: {len(eps)}")
+print(f"Files covered: {manifest.get('total_js_files', 0)}")
+raw_count = len([e for e in eps if e.get("notes","").startswith("raw")])
+print(f"Pending enrichment: {raw_count}")
+if len(eps) == 0:
+    print("WARNING: 0 endpoints written — check grep output and re-run raw dump")
+PYEOF
+python3 /tmp/ep_raw_check.py
+```
+
+Step 7 (enrichment) updates these raw entries in place — replacing `"INFO"` with real `bb_potential`, assigning flags, and removing the `"raw — pending enrichment"` note. **If context runs out during enrichment, the raw paths are already safe in findings.json.**
+
+---
 
 ### Step 7 — Extract Endpoints to JSON (batch by BB potential tier)
 
@@ -426,7 +568,7 @@ path = "<output_dir>/findings.json"
 findings = json.load(open(path))
 
 # Build seen set from already-extracted endpoints
-seen = {(e["method"], e["path"], e["file"]) for e in findings["endpoints"]}
+seen = {(e["method"], e["path"]) for e in findings["endpoints"]}  # dedup by method+path only — same endpoint in multiple files = one entry
 
 new_endpoints = [
     # Fill from grep output — CRITICAL and HIGH only
@@ -438,7 +580,6 @@ new_endpoints = [
         "line": 15110,
         "flags": ["AUTH"],
         "bb_potential": "CRITICAL",
-        "prior_art": "UNKNOWN",
         "first_test": "Test PKCE bypass — send code_challenge_method=plain",
         "category": "Auth & Identity",
         "ep_type": "server",
@@ -449,7 +590,7 @@ new_endpoints = [
 
 added = 0
 for ep in new_endpoints:
-    key = (ep["method"], ep["path"], ep["file"])
+    key = (ep["method"], ep["path"])
     if key not in seen:
         seen.add(key)
         findings["endpoints"].append(ep)
@@ -479,13 +620,13 @@ import json, os
 
 path = "<output_dir>/findings.json"
 findings = json.load(open(path))
-seen = {(e["method"], e["path"], e["file"]) for e in findings["endpoints"]}
+seen = {(e["method"], e["path"]) for e in findings["endpoints"]}  # dedup by method+path only — same endpoint in multiple files = one entry
 
 # Client routes
 client_routes = [
     # { "method": "GET", "path": "/settings",
     #   "file": "cdn.example.com/assets/app.js", "line": N,
-    #   "flags": [], "bb_potential": "INFO", "prior_art": "UNKNOWN",
+    #   "flags": [], "bb_potential": "INFO",
     #   "first_test": "Navigate to route", "category": "Client Routes",
     #   "ep_type": "client_route", "single_request_test": False, "notes": "" }
 ]
@@ -495,9 +636,13 @@ for r in client_routes:
         seen.add(key)
         findings["endpoints"].append(r)
 
-# Auth signals
+# Auth signals — EVERY entry below must be independently re-verifiable.
+# Before adding an entry, you must have already seen its file:line in this
+# session's actual grep output (Step 2). If you cannot recall which grep
+# command produced a given entry, do not include it.
 findings["auth_signals"]["Token Storage"] = [
     # { "key": "sc_anonymous_token", "storage": "localStorage", "file": "...", "line": N, "risk": "MEDIUM" }
+    # Only add if this exact key+file+line appeared in a Step 2 grep result above.
 ]
 findings["auth_signals"]["OAuth / OIDC Signals"] = [
     # { "pattern": "response_type=token", "file": "...", "line": N, "notes": "implicit grant" }
@@ -505,21 +650,79 @@ findings["auth_signals"]["OAuth / OIDC Signals"] = [
 findings["auth_signals"]["Client-Side Role Checks"] = [
     # { "check": "user.isAdmin === true", "file": "...", "line": N }
 ]
-# ... fill other auth signal sections
+# If a Step 2 grep command returned zero matches, leave that category as an
+# empty list. Do not fill empty categories with inferred or invented entries.
 
 # Evidence gaps — only genuine gaps for this target
 findings["evidence_gaps"] = [
     # "Dynamic imports not statically traceable",
 ]
 
+# Mark enrichment complete in manifest
+findings.setdefault("meta", {}).setdefault("scan_manifest", {})["enrichment_done"] = True
+
 with open(path, "w") as f:
     json.dump(findings, f, indent=2)
-print(f"Batch 3 done: {len(findings['endpoints'])} total endpoints")
+print(f"Batch 3 done: {len(findings['endpoints'])} total endpoints — enrichment complete")
 PYEOF
 python3 /tmp/ep_batch3.py
 ```
 
-### Step 7b — Base URL Resolution
+**Automated verification — run this immediately after Batch 3, as a separate bash call. This is a real check, not advisory: any entry that fails verification is deleted, not just flagged.**
+
+```bash
+cat > /tmp/ep_verify_auth_signals.py << 'PYEOF'
+import json, os
+
+path = "<output_dir>/findings.json"
+js_dir = "<js_dir>"
+findings = json.load(open(path))
+
+removed = []
+for category, entries in findings.get("auth_signals", {}).items():
+    verified = []
+    for e in entries:
+        file_rel = e.get("file", "")
+        line_no = e.get("line", 0)
+        full_path = os.path.join(js_dir, file_rel)
+        if not os.path.exists(full_path):
+            removed.append((category, e, "file does not exist"))
+            continue
+        try:
+            with open(full_path, errors="ignore") as f:
+                lines = f.readlines()
+            if line_no < 1 or line_no > len(lines):
+                removed.append((category, e, f"line {line_no} out of range (file has {len(lines)} lines)"))
+                continue
+            # Check the claimed key/pattern actually appears within a small window of the claimed line
+            window_start = max(0, line_no - 3)
+            window_end = min(len(lines), line_no + 2)
+            window_text = "".join(lines[window_start:window_end])
+            needle = e.get("key") or e.get("pattern") or e.get("check") or ""
+            # Strip quotes/brackets for a loose substring check
+            needle_bare = needle.strip("\"'")
+            if needle_bare and needle_bare not in window_text:
+                removed.append((category, e, f"claimed text '{needle_bare}' not found near line {line_no}"))
+                continue
+            verified.append(e)
+        except Exception as ex:
+            removed.append((category, e, f"read error: {ex}"))
+    findings["auth_signals"][category] = verified
+
+with open(path, "w") as f:
+    json.dump(findings, f, indent=2)
+
+if removed:
+    print(f"VERIFICATION FAILED — {len(removed)} fabricated/unverifiable entries removed:")
+    for category, e, reason in removed:
+        print(f"  [{category}] {e.get('key', e.get('pattern', e.get('check', '?')))} @ {e.get('file','?')}:{e.get('line','?')} — {reason}")
+else:
+    print("All auth_signals entries verified against source files.")
+PYEOF
+python3 /tmp/ep_verify_auth_signals.py
+```
+
+If this reports removed entries, do not re-add them — they were not real findings. If it removes everything from a category, that category being empty is the correct, honest result.
 
 Extract the real API host from the JS bundles and write `base_url_map` to `findings.json`. Synthesis and the Caido handoff use this to build correct manual test requests — without it they fall back to the JS CDN host, which is wrong.
 
@@ -626,54 +829,15 @@ INNEREOF
 python3 /tmp/ep_base_url.py
 ```
 
-**Propagate prior_art from bb_context to every endpoint:**
-
-```bash
-cat > /tmp/ep_prior_art.py << 'INNEREOF'
-import json
-
-path = "<output_dir>/findings.json"
-findings = json.load(open(path))
-
-prior_art_map = {
-    p["vuln_class"]: p["dupe_risk"]
-    for p in findings.get("bb_context", {}).get("prior_art_map", [])
-}
-
-FLAG_TO_VULN = {
-    "IDOR":     "IDOR",
-    "AUTH":     "AUTH_BYPASS",
-    "UPLOAD":   "FILE_UPLOAD",
-    "REDIRECT": "OPEN_REDIRECT",
-    "EXPORT":   "INFO_DISCLOSURE",
-}
-RISK_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NOVEL": 3, "UNKNOWN": 4}
-
-updated = 0
-for ep in findings.get("endpoints", []):
-    if ep.get("prior_art", "UNKNOWN") != "UNKNOWN":
-        continue
-    best = "UNKNOWN"
-    for flag in ep.get("flags", []):
-        vuln = FLAG_TO_VULN.get(flag)
-        if vuln and vuln in prior_art_map:
-            risk = prior_art_map[vuln]
-            if RISK_ORDER.get(risk, 4) < RISK_ORDER.get(best, 4):
-                best = risk
-    if best != "UNKNOWN":
-        ep["prior_art"] = best
-        updated += 1
-
-with open(path, "w") as f:
-    json.dump(findings, f, indent=2)
-print(f"prior_art propagated to {updated} endpoints from bb_context prior_art_map")
-INNEREOF
-python3 /tmp/ep_prior_art.py
-```
-
 ### Step 7c — IDOR Cluster Analysis
 
-After all endpoint batches are written, run the cluster pass. This groups IDOR-flagged endpoints by URL prefix so the synthesis agent can write one chain per attack surface instead of one chain per endpoint — reducing dupe risk on submission.
+Load the IDOR skill before running this step — it contains attack patterns from 26 disclosed reports that inform which endpoints to flag as `viable_primaries` and what to write in `first_test`:
+
+```
+skill(name="hunt-idor")
+```
+
+After all endpoint batches are written, run the cluster pass. This groups IDOR-flagged endpoints by URL prefix into one recommended test target per attack surface instead of one per endpoint — the renderer puts this directly in Endpoints.md as the IDOR recommendation.
 
 ```bash
 cat > /tmp/ep_idor_cluster.py << 'PYEOF'
@@ -684,14 +848,37 @@ findings = json.load(open(path))
 
 idor_eps = [e for e in findings["endpoints"] if "IDOR" in e.get("flags", []) and e.get("ep_type") == "server"]
 
-# Build clusters: group by (host, first 2 path segments)
+def has_structural_id(ep_path):
+    """Return True if this specific path has a structural ID indicator."""
+    segs = ep_path.split()[-1] if " " in ep_path else ep_path  # strip method prefix if present
+    # Named placeholder: :id, :userId, {accountId}, <fileId>
+    if re.search(r"/:[a-zA-Z_]+|/\{[a-zA-Z_]+\}|/<[a-zA-Z_]+>", segs):
+        return True
+    # Bare integer segment
+    if re.search(r"/\d{1,15}(/|$)", segs):
+        return True
+    # UUID segment
+    if re.search(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", segs, re.I):
+        return True
+    # ALL_CAPS_PLACEHOLDER segment (e.g. COUPON_ID, SHARE_ID)
+    if re.search(r"/[A-Z][A-Z0-9_]{2,}(/|$)", segs):
+        return True
+    return False
+
+def id_type_from_path(ep_path):
+    if re.search(r"/:[a-z_]*(uuid|guid)|/\{[a-z_]*(uuid|guid)", ep_path, re.I):
+        return "uuid"
+    if re.search(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", ep_path, re.I):
+        return "uuid"
+    return "numeric"
+
+# Build clusters: group by (host, first 3 non-param path segments)
 clusters = {}
 for ep in idor_eps:
     host = ep.get("file", "").split("/")[0]
-    # Strip path params and IDs to get the prefix: /api/services/diary/:id -> /api/services/diary
     prefix_parts = []
     for seg in ep["path"].lstrip("/").split("/"):
-        if re.match(r"^[:{\[{]|^\d+$", seg):
+        if re.match(r"^[:{<]|^\d+$|^[A-Z][A-Z0-9_]{2,}$", seg):
             break
         prefix_parts.append(seg)
     prefix = "/" + "/".join(prefix_parts[:3]) if prefix_parts else ep["path"]
@@ -700,40 +887,36 @@ for ep in idor_eps:
         clusters[key] = {"host": host, "prefix": prefix, "endpoints": [], "methods": set(), "max_potential": "INFO"}
     clusters[key]["endpoints"].append(f"{ep['method']} {ep['path']}")
     clusters[key]["methods"].add(ep["method"])
-    # Track highest bb_potential in cluster
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     if order.get(ep.get("bb_potential","INFO"), 4) < order.get(clusters[key]["max_potential"], 4):
         clusters[key]["max_potential"] = ep.get("bb_potential", "INFO")
 
-# Serialize (sets -> lists)
 cluster_list = []
 for k, v in sorted(clusters.items(), key=lambda x: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}.get(x[1]["max_potential"],4)):
-    # Classify id_type from path patterns in cluster endpoints
-    id_type = "unknown"
-    for ep_path in v["endpoints"]:
-        if re.search(r"/:id|/:[a-z_]+id|/\{[a-z_]*id[a-z_]*\}", ep_path, re.I):
-            id_type = "numeric"  # assume numeric unless uuid pattern seen
-            break
-        if re.search(r"/:[a-z_]*(uuid|guid)|/\{[a-z_]*(uuid|guid)", ep_path, re.I):
-            id_type = "uuid"
-            break
-        # Also check for numeric-looking path segments already in sample paths
-        if re.search(r"/\d{1,10}(/|$)", ep_path):
-            id_type = "numeric"
-            break
-        # Check for uuid-looking path segments
-        if re.search(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", ep_path, re.I):
-            id_type = "uuid"
-            break
+    eps = v["endpoints"]
+    
+    # id_type: only look at endpoints that DIRECTLY have a structural ID
+    # Do NOT let deep sub-path siblings poison the cluster id_type
+    direct_structural = [e for e in eps if has_structural_id(e)]
+    if direct_structural:
+        id_type = id_type_from_path(direct_structural[0])
+    else:
+        id_type = "unknown"
+
+    # has_viable_primary: cluster is worth a chain only if at least one endpoint
+    # directly accepts an ID (not just a flat collection with no ID anywhere)
+    has_viable_primary = len(direct_structural) > 0
 
     cluster_list.append({
         "host": v["host"],
         "prefix": v["prefix"],
-        "endpoint_count": len(v["endpoints"]),
+        "endpoint_count": len(eps),
         "methods": sorted(v["methods"]),
         "max_potential": v["max_potential"],
         "id_type": id_type,
-        "sample_endpoints": v["endpoints"][:3],
+        "has_viable_primary": has_viable_primary,
+        "sample_endpoints": eps[:3],
+        "viable_primaries": direct_structural[:2],  # endpoints the hunter should test first for this cluster
         "note": "Test auth scoping on this prefix — if one IDOR works, all endpoints under this prefix likely share the same middleware"
     })
 
@@ -741,8 +924,11 @@ findings["idor_clusters"] = cluster_list
 with open(path, "w") as f:
     json.dump(findings, f, indent=2)
 print(f"IDOR clusters written: {len(cluster_list)} clusters from {len(idor_eps)} flagged endpoints")
-for c in cluster_list[:5]:
-    print(f"  {c['max_potential']} — {c['host']}{c['prefix']} ({c['endpoint_count']} endpoints)")
+viable = [c for c in cluster_list if c["has_viable_primary"]]
+print(f"  Viable for chains: {len(viable)} / {len(cluster_list)}")
+for c in cluster_list[:8]:
+    flag = "OK" if c["has_viable_primary"] else "SKIP(no structural ID)"
+    print(f"  {c['max_potential']} {flag} — {c['prefix']} id_type={c['id_type']}")
 PYEOF
 python3 /tmp/ep_idor_cluster.py
 ```
@@ -750,13 +936,13 @@ python3 /tmp/ep_idor_cluster.py
 ### Step 8 — Final Validation
 
 ```bash
-python3 "<workflow_dir>/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --validate-only
+python3 "<workflow_dir>/.opencode/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --validate-only
 ```
 
 If validation passes — run the renderer to generate Endpoints.md:
 
 ```bash
-python3 "<workflow_dir>/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --only endpoints
+python3 "<workflow_dir>/.opencode/tools/render_reports.py" --findings "<output_dir>/findings.json" --output-dir "<output_dir>" --only endpoints
 ```
 
 Verify output:
@@ -766,18 +952,21 @@ import json, os
 d = json.load(open('<output_dir>/findings.json'))
 ep_count = len(d.get('endpoints', []))
 md_size = os.path.getsize('<output_dir>/Endpoints.md')
+enrichment_done = d.get('meta', {}).get('scan_manifest', {}).get('enrichment_done', False)
 print(f'endpoints in JSON: {ep_count}')
 print(f'Endpoints.md: {md_size} bytes')
-hosts = {}
+files = {}
 for e in d['endpoints']:
-    h = e.get('host','unknown')
-    hosts[h] = hosts.get(h, 0) + 1
-print('Hosts:', dict(sorted(hosts.items(), key=lambda x: -x[1])[:10]))
-assert ep_count > 0, 'No endpoints extracted — something went wrong'
-assert md_size > 1500, 'Endpoints.md too small — render may have failed'
+    h = e.get('file','unknown').split('/')[0]
+    files[h] = files.get(h, 0) + 1
+print('JS hosts:', dict(sorted(files.items(), key=lambda x: -x[1])[:10]))
+# A JS bundle with genuinely zero discoverable endpoints is a valid result —
+# do not gate on ep_count or render byte size. enrichment_done (set at the
+# end of Batch 3) is the authoritative signal that the agent actually finished.
+assert enrichment_done, 'enrichment_done is False — Batch 3 did not finish writing'
 print('PASS')
 "
 ```
 
-If `ep_count` is 0 or `md_size` < 1500 — do not proceed. Read the JSON file, identify what's missing, and write the missing batches.
+If `enrichment_done` is False — do not proceed. Read the JSON file, identify what's missing, and write the missing batches.
 
