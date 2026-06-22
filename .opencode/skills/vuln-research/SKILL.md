@@ -1,3 +1,8 @@
+---
+name: vuln-research
+description: Centralized intel gathering for exploitation technique-level knowledge — how vulnerabilities are exploited, what variants exist, what bypasses work, recent community-published research. Runs in parallel with hackerone-api as part of caido-intel, not as a fallback. Results stored in h1_intel.vuln_research with a 24h TTL.
+---
+
 # Vuln Research Skill
 
 Use this skill when performing the centralized intel gathering phase. It runs in parallel with `hackerone-api` — not as a fallback. Its role is technique-level knowledge: how vulnerabilities are exploited, what variants exist, what bypasses work, what the security community has published recently. H1 intel gives you target history; this gives you attack methodology.

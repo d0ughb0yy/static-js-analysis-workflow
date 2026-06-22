@@ -465,7 +465,7 @@ findings.setdefault("auth_signals", {
     "Client-Side Price Controls": []
 })
 findings.setdefault("evidence_gaps", [])
-findings.setdefault("taint_paths", [])
+findings.setdefault("sinks", [])
 findings.setdefault("secrets", [])
 findings.setdefault("staging_urls", [])
 findings.setdefault("env_references", [])

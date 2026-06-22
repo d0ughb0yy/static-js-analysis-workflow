@@ -23,10 +23,9 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 REQUIRED_ENDPOINT_FIELDS = {"method", "path", "file", "line", "flags", "bb_potential", "first_test", "category", "ep_type"}
-REQUIRED_TAINT_FIELDS = {"id", "source_type", "sink_type", "source_file", "source_line", "sink_file", "sink_line", "confidence", "sanitizer"}
+REQUIRED_SINK_FIELDS = {"type", "pattern", "file", "line"}
 REQUIRED_SECRET_FIELDS = {"type", "file", "line", "value_redacted", "confirmed"}
 VALID_BB_POTENTIAL = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
-VALID_CONFIDENCE = {"CONFIRMED", "INFERRED", "BLOCKED"}
 VALID_FLAGS = {"IDOR", "ADMIN", "UPLOAD", "REDIRECT", "AUTH", "EXPORT", "WEBSOCKET", "GRAPHQL", "CORS"}
 VALID_CATEGORIES = {
     "Auth & Identity", "Admin & Internal", "Data & Content",
@@ -37,7 +36,7 @@ VALID_CATEGORIES = {
 }
 VALID_EP_TYPES = {"server", "client_route", "websocket", "graphql"}
 MAX_ENDPOINTS = 2000
-MAX_TAINT_PATHS = 500
+MAX_SINKS = 2000
 
 def validate_endpoint(ep: dict, idx: int) -> list[str]:
     errors = []
@@ -63,13 +62,13 @@ def validate_endpoint(ep: dict, idx: int) -> list[str]:
         errors.append(f"endpoint[{idx}] line must be int, got {type(ep.get('line')).__name__} -- path={ep.get('path','?')}")
     return errors
 
-def validate_taint(tp: dict, idx: int) -> list[str]:
+def validate_sink(sk: dict, idx: int) -> list[str]:
     errors = []
-    missing = REQUIRED_TAINT_FIELDS - set(tp.keys())
+    missing = REQUIRED_SINK_FIELDS - set(sk.keys())
     if missing:
-        errors.append(f"taint_path[{idx}] missing fields: {missing}")
-    if tp.get("confidence") not in VALID_CONFIDENCE:
-        errors.append(f"taint_path[{idx}] invalid confidence: {tp.get('confidence')}")
+        errors.append(f"sink[{idx}] missing fields: {missing}")
+    if not isinstance(sk.get("line"), int):
+        errors.append(f"sink[{idx}] line must be int, got {type(sk.get('line')).__name__} -- file={sk.get('file','?')}")
     return errors
 
 def validate_findings(findings: dict) -> list[str]:
@@ -80,12 +79,12 @@ def validate_findings(findings: dict) -> list[str]:
         errors.append(f"schema_version must be 1, got: {findings.get('schema_version')}")
     if len(findings.get("endpoints", [])) > MAX_ENDPOINTS:
         errors.append(f"endpoints count {len(findings['endpoints'])} exceeds max {MAX_ENDPOINTS} — possible runaway extraction")
-    if len(findings.get("taint_paths", [])) > MAX_TAINT_PATHS:
-        errors.append(f"taint_paths count {len(findings['taint_paths'])} exceeds max {MAX_TAINT_PATHS} — possible hallucination loop")
+    if len(findings.get("sinks", [])) > MAX_SINKS:
+        errors.append(f"sinks count {len(findings['sinks'])} exceeds max {MAX_SINKS} — possible runaway extraction")
     for i, ep in enumerate(findings.get("endpoints", [])):
         errors.extend(validate_endpoint(ep, i))
-    for i, tp in enumerate(findings.get("taint_paths", [])):
-        errors.extend(validate_taint(tp, i))
+    for i, sk in enumerate(findings.get("sinks", [])):
+        errors.extend(validate_sink(sk, i))
     return errors
 
 BB_POTENTIAL_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
@@ -113,6 +112,29 @@ def file_host(file_path: str) -> str:
     if not file_path or "/" not in file_path:
         return file_path or "unknown"
     return file_path.split("/")[0]
+
+
+def md_cell(value) -> str:
+    """
+    Escapes a value for safe use inside a markdown table cell.
+
+    A literal `|` in any field — most commonly a raw regex pattern like
+    `(html|append|prepend|replaceWith)` ending up in a 'pattern' field instead
+    of the actual matched source text — gets interpreted by markdown table
+    parsers (including Obsidian) as an extra column delimiter. This silently
+    corrupts that row's column count, and most renderers then pad every other
+    row in the table to match the widest row, producing garbled tables with
+    empty trailing columns across the entire table, not just the offending row.
+
+    Also collapses embedded newlines, which would otherwise break out of the
+    cell entirely and corrupt the table in a different way.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    s = s.replace("\\", "\\\\").replace("|", "\\|")
+    s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return s
 
 
 def merge_findings(base: dict, new: dict) -> dict:
@@ -167,6 +189,16 @@ def merge_findings(base: dict, new: dict) -> dict:
         if key not in base_sec_index:
             merged_secs.append(sec)
     merged["secrets"] = merged_secs
+
+    # Sinks — key by (file, line), same dedup pattern the agent's own writes use
+    base_sink_keys = {(s.get("file"), s.get("line")) for s in base.get("sinks", [])}
+    merged_sinks = list(base.get("sinks", []))
+    for sk in new.get("sinks", []):
+        key = (sk.get("file"), sk.get("line"))
+        if key not in base_sink_keys:
+            merged_sinks.append(sk)
+            base_sink_keys.add(key)
+    merged["sinks"] = merged_sinks
 
     merged["meta"]["last_merged"] = datetime.utcnow().isoformat()
     merged["meta"]["merge_stats"] = {
@@ -325,7 +357,7 @@ def render_endpoints(findings: dict, host_map: dict = None) -> str:
         for fpath in sorted(hdata["files"], key=lambda fp: -file_stats[fp]["count"]):
             fdata = file_stats[fpath]
             fflags = ", ".join(f"{k}={v}" for k, v in sorted(fdata["flags"].items(), key=lambda x: -x[1]))
-            lines.append(f"| `{fpath}` | {fdata['count']} | {fflags or '—'} |")
+            lines.append(f"| `{md_cell(fpath)}` | {fdata['count']} | {md_cell(fflags) or '—'} |")
         lines.append("")
 
     # --- Category tables ---
@@ -376,7 +408,7 @@ def render_endpoints(findings: dict, host_map: dict = None) -> str:
         lines.append("| Path | File | Line | Notes |")
         lines.append("|------|------|------|-------|")
         for ep in client_eps:
-            lines.append(f"| `{ep.get('path','?')}` | {ep.get('file','?')} | {ep.get('line','?')} | {ep.get('notes','—')} |")
+            lines.append(f"| `{md_cell(ep.get('path','?'))}` | {md_cell(ep.get('file','?'))} | {ep.get('line','?')} | {md_cell(ep.get('notes','—'))} |")
         lines.append("")
 
     # --- Auth Signals ---
@@ -391,23 +423,23 @@ def render_endpoints(findings: dict, host_map: dict = None) -> str:
                 lines.append("| Token Key | Storage | File | Line | Risk |")
                 lines.append("|-----------|---------|------|------|------|")
                 for r in rows:
-                    lines.append(f"| {r.get('key','—')} | {r.get('storage','—')} | {r.get('file','—')} | {r.get('line','—')} | {r.get('risk','—')} |")
+                    lines.append(f"| {md_cell(r.get('key','—'))} | {md_cell(r.get('storage','—'))} | {md_cell(r.get('file','—'))} | {r.get('line','—')} | {md_cell(r.get('risk','—'))} |")
             elif section == "OAuth / OIDC Signals":
                 lines.append("| Pattern | File | Line | Notes |")
                 lines.append("|---------|------|------|-------|")
                 for r in rows:
-                    lines.append(f"| {r.get('pattern','—')} | {r.get('file','—')} | {r.get('line','—')} | {r.get('notes','—')} |")
+                    lines.append(f"| {md_cell(r.get('pattern','—'))} | {md_cell(r.get('file','—'))} | {r.get('line','—')} | {md_cell(r.get('notes','—'))} |")
             elif section == "Client-Side Role Checks":
                 lines.append("> Every row here is a potential bypass — server must enforce the same check.\n")
                 lines.append("| Check | File | Line |")
                 lines.append("|-------|------|------|")
                 for r in rows:
-                    lines.append(f"| {r.get('check','—')} | {r.get('file','—')} | {r.get('line','—')} |")
+                    lines.append(f"| {md_cell(r.get('check','—'))} | {md_cell(r.get('file','—'))} | {r.get('line','—')} |")
             else:
                 lines.append("| Pattern | File | Line | Risk |")
                 lines.append("|---------|------|------|------|")
                 for r in rows:
-                    lines.append(f"| {r.get('pattern', r.get('check', '—'))} | {r.get('file','—')} | {r.get('line','—')} | {r.get('risk','—')} |")
+                    lines.append(f"| {md_cell(r.get('pattern', r.get('check', '—')))} | {md_cell(r.get('file','—'))} | {r.get('line','—')} | {md_cell(r.get('risk','—'))} |")
             lines.append("")
 
     # --- Evidence Gaps ---
@@ -421,220 +453,61 @@ def render_endpoints(findings: dict, host_map: dict = None) -> str:
     return "\n".join(lines)
 
 
-def render_taint(findings: dict, host_map: dict = None) -> str:
-    taint_paths = findings.get("taint_paths", [])
-    if not taint_paths:
-        return "# Taint Analysis\n\nNo taint paths found.\n"
-
-    lines = ["# Taint Analysis\n"]
-
-    # --- Top Findings ---
-    confirmed = [tp for tp in taint_paths if tp["confidence"] == "CONFIRMED"]
-    inferred = [tp for tp in taint_paths if tp["confidence"] == "INFERRED"]
-    CONF_ORDER = {"CONFIRMED": 0, "INFERRED": 1}
-    top = sorted(confirmed + inferred,
-                 key=lambda t: (CONF_ORDER.get(t["confidence"], 9), t["id"]))
-
-    lines.append("## Top Findings\n")
-    lines.append("> Source-to-sink paths where user input reaches a dangerous sink, ranked by confidence.\n")
-    lines.append("| Rank | Finding | Confidence | Sanitizer | File | Line |")
-    lines.append("|------|---------|------------|-----------|------|------|")
-    for i, tp in enumerate(top, 1):
-        summary = tp.get("summary", f"{tp['source_type']} → {tp['sink_type']}")
-        lines.append(f"| {i} | {summary} | {tp['confidence']} | {tp.get('sanitizer', 'None')} | {tp['source_file']} | {tp['source_line']} |")
-    lines.append("")
-
-    # --- Summary ---
-    sources = findings.get("sources", [])
+def render_sinks(findings: dict, host_map: dict = None) -> str:
     sinks = findings.get("sinks", [])
-    pm_handlers = findings.get("postmessage_handlers", [])
-    weak_origins = [h for h in pm_handlers if h.get("origin_check") == "NONE"]
-    proto_candidates = findings.get("prototype_pollution", [])
+    sc = findings.get("security_components", {})
+    cookie_readable = sc.get("cookie_readable", False)
 
-    lines.append("## Summary\n")
-    lines.append(f"- Sources found: {len(sources)}")
-    lines.append(f"- Sinks found: {len(sinks)}")
-    lines.append(f"- Confirmed taint paths: {len(confirmed)}")
-    lines.append(f"- Inferred taint paths: {len(inferred)}")
-    lines.append(f"- postMessage handlers: {len(pm_handlers)} (weak origin checks: {len(weak_origins)})")
-    lines.append(f"- Prototype pollution candidates: {len(proto_candidates)}")
+    if not sinks and not cookie_readable:
+        return "# Sinks\n\nNo dangerous sink call-sites found.\n"
+
+    lines = ["# Sinks\n"]
+    lines.append(
+        "> Raw inventory of dangerous JS sink call-sites (innerHTML, eval, "
+        "dangerouslySetInnerHTML, jQuery DOM injection, Angular trust bypass, "
+        "prototype pollution, navigation). This is NOT a taint trace — these are "
+        "every call-site found by static grep, with no claim that user input "
+        "actually reaches any specific one. Treat this as a worklist: cross-reference "
+        "against Endpoints.md and manually verify whether a specific sink is reachable "
+        "from a request you control before reporting it.\n"
+    )
+
+    if cookie_readable:
+        lines.append(
+            "**Cookies are readable from JS** (`document.cookie` found in bundle) — "
+            "auth cookies are NOT HttpOnly. If any sink below turns out to be reachable "
+            "with attacker-controlled input, it upgrades directly to session theft.\n"
+        )
+
+    by_type: dict[str, list[dict]] = {}
+    for s in sinks:
+        by_type.setdefault(s.get("type", "unknown"), []).append(s)
+
+    lines.append(f"## Summary\n")
+    lines.append(f"- Total sinks found: {len(sinks)}")
+    for t in sorted(by_type, key=lambda k: -len(by_type[k])):
+        lines.append(f"  - {t}: {len(by_type[t])}")
     lines.append("")
 
-    # --- Sources ---
-    if sources:
-        lines.append("## Sources\n")
-        lines.append("| Type | Pattern | File | Line |")
-        lines.append("|------|---------|------|------|")
-        for s in sources:
-            lines.append(f"| {s.get('type','—')} | `{s.get('pattern','—')}` | {s.get('file','—')} | {s.get('line','—')} |")
-        lines.append("")
-
-    # --- Sinks ---
-    if sinks:
-        lines.append("## Sinks\n")
-        lines.append("| Type | Pattern | File | Line |")
-        lines.append("|------|---------|------|------|")
-        for s in sinks:
-            lines.append(f"| {s.get('type','—')} | `{s.get('pattern','—')}` | {s.get('file','—')} | {s.get('line','—')} |")
-        lines.append("")
-
-    # --- Taint Paths ---
-    if taint_paths:
-        lines.append("## Taint Paths\n")
-        for tp in top:
-            lines.append(f"### {tp['id']}: {tp.get('summary', tp['source_type'] + ' → ' + tp['sink_type'])}\n")
-            hops = tp.get("hops", [])
-            if hops:
-                lines.append("| Hop | Operation | File | Line | Status |")
-                lines.append("|-----|-----------|------|------|--------|")
-                for hop in hops:
-                    lines.append(f"| {hop.get('hop','—')} | {hop.get('operation','—')} | {hop.get('file','—')} | {hop.get('line','—')} | {hop.get('status','—')} |")
-                lines.append("")
-            lines.append(f"Sanitizer: {tp.get('sanitizer', 'None')}")
-            lines.append(f"Confidence: {tp['confidence']}")
-            lines.append(f"Risk: {tp.get('risk_description', '—')}")
-            lines.append("")
-            verify = tp.get("how_to_verify", "")
-            if verify:
-                lines.append(f"How to verify: {verify}")
-                lines.append("")
-            lines.append("\n---\n")
-
-    # --- postMessage ---
-    if pm_handlers:
-        lines.append("## postMessage Handlers\n")
-        lines.append("| File | Line | Origin Check | Risk |")
-        lines.append("|------|------|-------------|------|")
-        for h in pm_handlers:
-            lines.append(f"| {h.get('file','—')} | {h.get('line','—')} | {h.get('origin_check','—')} | {h.get('risk','—')} |")
-        lines.append("")
-
-    # --- CSRF ---
-    csrf = findings.get("csrf_analysis", {})
-    if csrf:
-        lines.append("## CSRF Analysis\n")
-        mitigations = csrf.get("mitigations", [])
-        if mitigations:
-            lines.append("### Mitigations Found\n")
-            lines.append("| Mitigation | Where Applied | File | Line |")
-            lines.append("|------------|---------------|------|------|")
-            for m in mitigations:
-                lines.append(f"| {m.get('type','—')} | {m.get('where','—')} | {m.get('file','—')} | {m.get('line','—')} |")
-            lines.append("")
-        ep_risks = csrf.get("endpoint_risks", [])
-        if ep_risks:
-            lines.append("### Endpoint Risk\n")
-            lines.append("| Endpoint | Method | Auth Type | CSRF Protection | Risk |")
-            lines.append("|----------|--------|-----------|-----------------|------|")
-            for r in ep_risks:
-                lines.append(f"| `{r.get('endpoint','—')}` | {r.get('method','—')} | {r.get('auth_type','—')} | {r.get('csrf_protection','None')} | {r.get('risk','—')} |")
-            lines.append("")
-
-    # --- Prototype Pollution ---
-    if proto_candidates:
-        lines.append("## Prototype Pollution Candidates\n")
-        lines.append("| Merge Function | User Input Source | File | Line | Test Payload |")
-        lines.append("|----------------|-------------------|------|------|--------------|")
-        for p in proto_candidates:
-            lines.append(f"| {p.get('function','—')} | {p.get('input_source','—')} | {p.get('file','—')} | {p.get('line','—')} | `{p.get('test_payload','—')}` |")
-        lines.append("")
-
-    # --- Service Workers ---
-    sw = findings.get("service_workers", [])
-    if sw:
-        lines.append("## Service Workers\n")
-        for w in sw:
-            lines.append(f"### {w.get('file','unknown')}\n")
-            lines.append(f"- importScripts versioned: {w.get('versioned_imports', 'unknown')}")
-            lines.append(f"- Risk: {w.get('risk','—')}")
-            lines.append("")
-
-    # --- Sanitizers ---
-    sc = findings.get("security_components", {})
-    if sc:
-        lines.append("## Security Components\n")
-
-        any_defense = False
-
-        dp = sc.get("dompurify", {})
-        if dp.get("present"):
-            any_defense = True
-            cve_str = ", ".join(dp.get("cves", [])) or "none"
-            overrides = ", ".join(dp.get("config_overrides", [])) or "none"
-            lines.append(f"**DOMPurify** v{dp.get('version','UNKNOWN')} — CVE risk: `{dp.get('cve_risk','UNKNOWN')}` — CVEs: {cve_str}")
-            lines.append(f"Config overrides: {overrides}")
-            if dp.get("notes"):
-                lines.append(f"Notes: {dp['notes']}")
-            lines.append("")
-
-        for s in sc.get("other_sanitizers", []):
-            any_defense = True
-            lines.append(f"**{s.get('name','?')}** — {s.get('file','?')}:{s.get('line','?')} — {s.get('notes','')}")
-        if sc.get("other_sanitizers"):
-            lines.append("")
-
-        filters = sc.get("hardcoded_filters", [])
-        if filters:
-            any_defense = True
-            lines.append(f"**Hardcoded filters:** {len(filters)}")
-            lines.append("| Type | Scope | Case sensitive | Action | Bypass notes |")
-            lines.append("|------|-------|---------------|--------|-------------|")
-            for f in filters:
-                lines.append(f"| {f.get('type','?')} | {f.get('scope','?')} | {f.get('case_sensitive','?')} | {f.get('action','?')} | {f.get('bypass_notes','—')} |")
-            lines.append("")
-
-        if sc.get("trusted_types"):
-            any_defense = True
-            lines.append("**Trusted Types:** enforced — XSS requires policy bypass")
-            lines.append("")
-
-        for a in sc.get("angular_trust_bypass", []):
-            any_defense = True
-            lines.append(f"**Angular bypassSecurityTrust{a.get('type','?')}** — {a.get('file','?')}:{a.get('line','?')} — opt-out of Angular sanitizer, trace input")
-        if sc.get("angular_trust_bypass"):
-            lines.append("")
-
-        domparser = sc.get("domparser_misuse", [])
-        if domparser:
-            lines.append(f"**DOMParser misuse (false sanitizer):** {len(domparser)} occurrence(s) — DOMParser.parseFromString does NOT sanitize, sinks through here remain CONFIRMED")
-            for d in domparser:
-                lines.append(f"  - {d.get('file','?')}:{d.get('line','?')}")
-            lines.append("")
-
-        if sc.get("cookie_readable"):
-            lines.append("**Cookies:** `document.cookie` readable — auth cookies are NOT HttpOnly, any confirmed XSS path upgrades to session theft")
-            lines.append("")
-
-        if not any_defense:
-            lines.append("No sanitizers, security libraries, Trusted Types, or hardcoded filters detected.")
-            lines.append("All innerHTML / dangerouslySetInnerHTML / eval sinks are unmitigated.")
-            lines.append("")
-
-        csp = sc.get("csp_enforcement", "UNKNOWN")
-        if csp != "UNKNOWN":
-            lines.append(f"CSP enforcement: **{csp}**")
-            lines.append("")
-
-        if sc.get("notes"):
-            lines.append(f"Notes: {sc['notes']}")
-            lines.append("")
-
-    elif findings.get("sanitizers"):
-        # Legacy fallback
-        sanitizers = findings["sanitizers"]
-        lines.append("## Sanitizers\n")
-        lines.append("| Sanitizer | File | Line | Effectiveness | Bypass Risk |")
-        lines.append("|-----------|------|------|--------------|-------------|")
-        for s in sanitizers:
-            lines.append(f"| {s.get('name','—')} | {s.get('file','—')} | {s.get('line','—')} | {s.get('effectiveness','—')} | {s.get('bypass_risk','—')} |")
-        lines.append("")
+    lines.append("## All Sinks\n")
+    lines.append("| Type | Pattern | File | Line |")
+    lines.append("|------|---------|------|------|")
+    sorted_sinks = sorted(sinks, key=lambda s: (s.get("type", ""), s.get("file", ""), s.get("line", 0)))
+    for s in sorted_sinks:
+        lines.append(f"| {md_cell(s.get('type','—'))} | `{md_cell(s.get('pattern','—'))}` | {md_cell(s.get('file','—'))} | {s.get('line','—')} |")
+    lines.append("")
 
     return "\n".join(lines)
 
-
 def render_secrets(findings: dict, host_map: dict = None) -> str:
     secrets = findings.get("secrets", [])
-    if not secrets:
+    staging_urls = findings.get("staging_urls", [])
+    env_refs = findings.get("env_references", [])
+
+    # Only the literal absence of every category means there's nothing to report.
+    # A clean TruffleHog scan (0 secrets) is the common case and must not suppress
+    # staging-URL or env-reference findings, which are an independent category.
+    if not any([secrets, staging_urls, env_refs]):
         return "# Secrets\n\nNo secrets found.\n"
 
     lines = ["# Secrets\n"]
@@ -646,7 +519,7 @@ def render_secrets(findings: dict, host_map: dict = None) -> str:
         lines.append("| Type | Value (redacted) | File | Line | Risk |")
         lines.append("|------|-----------------|------|------|------|")
         for s in confirmed:
-            lines.append(f"| {s['type']} | `{s['value_redacted']}` | {s['file']} | {s['line']} | {s.get('risk','HIGH')} |")
+            lines.append(f"| {md_cell(s['type'])} | `{md_cell(s['value_redacted'])}` | {md_cell(s['file'])} | {s['line']} | {md_cell(s.get('risk','HIGH'))} |")
         lines.append("")
 
     if unconfirmed:
@@ -654,25 +527,24 @@ def render_secrets(findings: dict, host_map: dict = None) -> str:
         lines.append("| Type | Value (redacted) | File | Line | False Positive Risk |")
         lines.append("|------|-----------------|------|------|---------------------|")
         for s in unconfirmed:
-            lines.append(f"| {s['type']} | `{s['value_redacted']}` | {s['file']} | {s['line']} | {s.get('fp_risk','MEDIUM')} |")
+            lines.append(f"| {md_cell(s['type'])} | `{md_cell(s['value_redacted'])}` | {md_cell(s['file'])} | {s['line']} | {md_cell(s.get('fp_risk','MEDIUM'))} |")
         lines.append("")
 
-    staging_urls = findings.get("staging_urls", [])
     if staging_urls:
         lines.append("## Staging & Internal URLs\n")
         lines.append("| URL | File | Line | Notes |")
         lines.append("|-----|------|------|-------|")
         for u in staging_urls:
-            lines.append(f"| `{u.get('url','—')}` | {u.get('file','—')} | {u.get('line','—')} | {u.get('notes','—')} |")
+            lines.append(f"| `{md_cell(u.get('url','—'))}` | {md_cell(u.get('file','—'))} | {u.get('line','—')} | {md_cell(u.get('notes','—'))} |")
         lines.append("")
 
-    env_refs = findings.get("env_references", [])
     if env_refs:
         lines.append("## Environment References\n")
         lines.append("| Variable | File | Line |")
         lines.append("|----------|------|------|")
         for r in env_refs:
-            lines.append(f"| `{r.get('variable','—')}` | {r.get('file','—')} | {r.get('line','—')} |")
+            var_name = r.get('variable', r.get('var', '—'))
+            lines.append(f"| `{md_cell(var_name)}` | {md_cell(r.get('file','—'))} | {r.get('line','—')} |")
         lines.append("")
 
     return "\n".join(lines)
@@ -688,7 +560,7 @@ def main():
     parser.add_argument("--host-map", required=False, default=None, help="Path to host_map.json (optional — file paths are now the source of truth)")
     parser.add_argument("--output-dir", required=True, help="Output directory for markdown files")
     parser.add_argument("--merge", help="Path to new_findings.json to merge before rendering")
-    parser.add_argument("--only", choices=["endpoints", "taint", "secrets", "bbcontext", "all"], default="all")
+    parser.add_argument("--only", choices=["endpoints", "sinks", "secrets", "all"], default="all")
     parser.add_argument("--validate-only", action="store_true", help="Validate schema and exit without rendering")
     args = parser.parse_args()
 
@@ -745,7 +617,7 @@ def main():
 
     renders = {
         "endpoints": ("Endpoints.md", lambda: render_endpoints(findings, host_map)),
-        "taint": ("Taint.md", lambda: render_taint(findings, host_map)),
+        "sinks": ("Sinks.md", lambda: render_sinks(findings, host_map)),
         "secrets": ("Secrets.md", lambda: render_secrets(findings)),
     }
 

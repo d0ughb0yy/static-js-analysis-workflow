@@ -1,3 +1,8 @@
+---
+name: hackerone-api
+description: Query the HackerOne GraphQL API for program scope, weakness type exclusions, disclosed reports by target, or disclosed reports by vulnerability class. Requires HACKERONE_API_TOKEN. Used by caido-intel for centralized intel gathering before probing.
+---
+
 # HackerOne API Skill
 
 Use this skill whenever you need to query the HackerOne GraphQL API — for program scope, weakness type exclusions, disclosed reports by target, or disclosed reports by vulnerability class.

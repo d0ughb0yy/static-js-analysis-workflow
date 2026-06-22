@@ -1,3 +1,8 @@
+---
+name: prior-art-lookup
+description: Find which bug bounty platform/program a target belongs to, out-of-scope hosts, and a rough dupe-risk signal per vulnerability class based on publicly disclosed reports. Unauthenticated and non-blocking — no API token, no rate-limit risk. Used by js-discovery at the start of the JS pipeline.
+---
+
 # Prior Art Lookup Skill
 
 Use this skill to find which bug bounty platform/program a target belongs to, what's in/out of scope, and a rough dupe-risk signal per vulnerability class based on publicly disclosed reports. Everything here is unauthenticated and non-blocking — no API token required, no rate-limit risk that can stall a run.

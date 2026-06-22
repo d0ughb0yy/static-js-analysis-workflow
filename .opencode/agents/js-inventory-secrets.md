@@ -205,7 +205,7 @@ If secrets already has entries — load into a seen set `(value_redacted, file, 
 
 **You write JSON. The renderer generates Secrets.md. Zero markdown.**
 
-**STRICTLY FORBIDDEN:** Do NOT write `endpoints`, `idor_clusters`, `taint_paths`, or `base_url_map` keys. Those are owned by Phase 2 and Phase 3. If your grep output surfaces API paths while reading JS files, discard them — do not write them to findings.json. Writing endpoints here produces 100+ schema validation errors that block all downstream rendering.
+**STRICTLY FORBIDDEN:** Do NOT write `endpoints`, `idor_clusters`, `sinks`, or `base_url_map` keys. Those are owned by Phase 2 and Phase 3. If your grep output surfaces API paths while reading JS files, discard them — do not write them to findings.json. Writing endpoints here produces 100+ schema validation errors that block all downstream rendering.
 
 You write ONLY: `secrets`, `staging_urls`, `env_references`, and `meta.secrets_scan`.
 
@@ -327,7 +327,7 @@ findings.setdefault("meta", {})["secrets_scan"] = {
 }
 
 # Safety guard: never write Phase 2/3 keys — they cause schema validation errors
-for _fk in ("endpoints", "idor_clusters", "taint_paths", "base_url_map"):
+for _fk in ("endpoints", "idor_clusters", "sinks", "base_url_map"):
     if _fk in findings and _fk not in original_keys:
         del findings[_fk]
         print(f"GUARD: removed accidentally-added key '{_fk}' — belongs to Phase 2/3")
