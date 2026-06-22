@@ -11,9 +11,9 @@ The **JS pipeline** takes a directory of downloaded JavaScript bundles and runs 
 | **0** | `js-discovery` | `findings.json:meta.program_intel` | Identifies the bug bounty platform/program, merges out-of-scope hosts, computes dupe-risk per vuln class. Non-blocking — degrades gracefully to UNKNOWN. |
 | **1** | `js-inventory-secrets` | `findings.json:secrets` → `Secrets.md` | Decodes source maps (`.js.map` → original source via `sourcemapper`), runs TruffleHog + grep for secrets, extracts staging/internal URLs, `process.env` and `import.meta.env` references, plus subdomain takeover candidates. |
 | **2** | `js-api-mapper` | `findings.json:endpoints` → `Endpoints.md` | Full API surface extraction — REST endpoints with methods/paths, base URLs, WebSocket connections, client-side routes, GraphQL operations, and security flags (IDOR, AUTH, UPLOAD, ADMIN, REDIRECT). Every endpoint gets a `bb_potential` rating and a `first_test` action. |
-| **3** | `js-taint-analyzer` | `findings.json:taint_paths` → `Taint.md` | Static source-to-sink taint analysis, prototype pollution detection, postMessage origin validation, CSRF analysis, service worker inspection, DOM purifier version/CVE detection, auth signal extraction (token storage, JWT issues, OAuth flows, client-side role checks, price controls). |
+| **3** | `js-sink-scanner` | `findings.json:sinks` → `Sinks.md` | Greps the JS bundle for dangerous sink call-sites (innerHTML, eval, dangerouslySetInnerHTML, jQuery DOM injection, Angular trust bypass, prototype pollution, navigation sinks, cookie readability). Does NOT trace data flow — writes a flat inventory for manual review. |
 
-**Orchestrator:** `js-orchestrator` — runs Phases 0–3 sequentially with checkpoint/retry on each. Single entry point. Output: `findings.json` + `Secrets.md` + `Endpoints.md` + `Taint.md`.
+**Orchestrator:** `js-orchestrator` — runs Phases 0–3 sequentially with checkpoint/retry on each. Single entry point. Output: `findings.json` + `Secrets.md` + `Endpoints.md` + `Sinks.md`.
 
 ## Caido Hunting Ecosystem
 
@@ -40,7 +40,7 @@ A separate, independent ecosystem that reads the JS pipeline's output and active
 │   │   ├── js-discovery.md        # Phase 0 — program/prior-art discovery
 │   │   ├── js-inventory-secrets.md# Phase 1 — source maps + secrets
 │   │   ├── js-api-mapper.md       # Phase 2 — API endpoint extraction
-│   │   ├── js-taint-analyzer.md   # Phase 3 — taint + prototype pollution
+│   │   ├── js-sink-scanner.md     # Phase 3 — dangerous sink inventory
 │   │   ├── caido-orchestrator.md  # Caido ecosystem entry point
 │   │   ├── caido-intel.md         # Caido Phase 1 — intel gathering
 │   │   ├── caido-session-builder.md # Caido Phase 2 — Replay session staging
@@ -49,7 +49,6 @@ A separate, independent ecosystem that reads the JS pipeline's output and active
 │   ├── skills/                    # Reusable skills loaded by agents
 │   │   ├── decode-sourcemaps/     # Source map → original source via sourcemapper
 │   │   ├── graphql-mapper/        # GraphQL operation/fragment extraction
-│   │   ├── service-worker-checker/ # Service worker fetch interception analysis
 │   │   ├── hackerone-api/         # HackerOne disclosed report search
 │   │   ├── prior-art-lookup/      # Dupe risk / prior art research
 │   │   └── vuln-research/         # Web-based vulnerability research pass
@@ -83,10 +82,10 @@ Optional: `Target domain: example.com` and/or `Context: <hunter notes>`
 Output:
 ```
 <output_dir>/
-├── findings.json       # All structured data (endpoints, secrets, taint paths, etc.)
+├── findings.json       # All structured data (endpoints, secrets, sinks, etc.)
 ├── Secrets.md          # Confirmed secrets + candidates + staging URLs
 ├── Endpoints.md         # API surface grouped by category with Top 10 table
-└── Taint.md             # Sources, sinks, taint paths, postMessage, prototype pollution
+└── Sinks.md             # Dangerous sink inventory by category (innerHTML, eval, etc.)
 ```
 
 ### Caido Ecosystem
@@ -102,7 +101,7 @@ Requires a completed JS pipeline run in the output directory. Optional: `Focus: 
 ### Zero Token Waste
 - Agents write to `findings.json` (structured JSON), never markdown
 - `render_reports.py` generates all markdown from JSON — pure Python, zero LLM tokens
-- Strict schema validation enforces completeness (max 2000 endpoints, 500 taint paths)
+- Strict schema validation enforces completeness (max 2000 endpoints, 2000 sinks)
 - Phase 0 extracts exactly two things (prior art, OOS classes) — no filler
 
 ### Hunter-Calibrated Output
@@ -113,7 +112,7 @@ All Caido agents merge by key — never overwrite. Sessions keyed on `chain_id`;
 
 ### Layered Defense
 - `program_scope.out_of_scope_vuln_classes` is a hard boundary — agents will not probe those
-- `findings.json` merge guards prevent Phase 1 from writing endpoint/taint keys
+- `findings.json` merge guards prevent Phase 1 from writing endpoint/sink keys
 - Phase agents each have distinct model assignments (low-temp for extraction, higher-temp for discovery)
 
 ### Cross-Program Pattern Library
